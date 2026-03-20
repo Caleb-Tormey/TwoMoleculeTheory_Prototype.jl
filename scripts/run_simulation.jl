@@ -42,7 +42,7 @@ function main()
     # We now explicitly tell it how many outer vs inner loops to run
     C_k, W_solv, h_fixed, configs = solve_two_molecule_theory!(
         sys, ch_params, grid, 
-        max_outer=2,       # Generate chains 2 times
+        max_outer=10,       # Generate chains 2 times
         max_inner=10,      # Converge C(r) 10 times per chain generation
         mix_param=0.05
     )
