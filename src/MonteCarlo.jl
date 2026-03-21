@@ -311,14 +311,18 @@ function sample_direct!(
         h_sim .+= ws.g_r_accum
     end
     
+    # At the bottom of sample_direct!
     norm_const = 144.0  
+    
+    # Safe limit: 10 * sigma
+    splice_n = round(Int, 10.0 * chain_params.σ[1] / grid.Δr)
+
     for i in 1:sys_params.N_sites, j in 1:sys_params.N_sites, k in 1:grid.N
-        if k <= stop_n
+        if k <= splice_n
             g_val = h_sim[i, j, k] / (k^2 * MC_steps * norm_const)
             h_sim[i, j, k] = g_val - 1.0 
         else
-            # BUG FIXED: Beyond the sampling cutoff, h(r) naturally decays to 0.0
-            h_sim[i, j, k] = 0.0
+            h_sim[i, j, k] = 0.0 # Will be overwritten by PRISM tail
         end
     end
 end
