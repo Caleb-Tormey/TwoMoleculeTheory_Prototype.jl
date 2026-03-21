@@ -37,3 +37,19 @@ function h_moment(h_data::AbstractVector{T}, n::Int, grid::RadialGrid{T}) where 
     prefactor = sign_val * (T(4.0) * T(π) / (n + 1))
     return prefactor * trap_integrate(temp, grid.Δr)
 end
+
+"""
+    save_to_csv(filename, grid_vals, data)
+
+Saves a 2x2 correlation or potential matrix to a clean CSV file.
+"""
+function save_to_csv(filename::String, grid_vals::Vector{T}, data::Array{T, 3}) where {T}
+    open(filename, "w") do io
+        println(io, "x, 11, 12, 21, 22")
+        for i in 1:length(grid_vals)
+            @printf(io, "%.6f, %.6e, %.6e, %.6e, %.6e\n", 
+                    grid_vals[i], data[1,1,i], data[1,2,i], data[2,1,i], data[2,2,i])
+        end
+    end
+    println("  -> Saved: $filename")
+end

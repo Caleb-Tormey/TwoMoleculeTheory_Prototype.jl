@@ -73,7 +73,7 @@ function solve_two_molecule_theory!(
     
     N_sites = sys_params.N_sites
     W_solv     = zeros(T, N_sites, N_sites, grid.N)
-    W_solv_old = zeros(T, N_sites, N_sites, grid.N) # NEW: To track W(r) for mixing
+    W_solv_old = zeros(T, N_sites, N_sites, grid.N)
     C_k        = zeros(T, N_sites, N_sites, grid.N)
     Ω_k        = zeros(T, N_sites, N_sites, grid.N)
     Δ_PRISM    = zeros(T, N_sites, N_sites, grid.N)
@@ -88,6 +88,11 @@ function solve_two_molecule_theory!(
     start_n = 33
     stop_n  = 600
     
+    # --- DIAGNOSTIC TRACKING LISTS ---
+    W_err_list = T[]
+    C_err_history = Vector{T}[]
+    δC_step_history = Vector{T}[]
+    
     local configs
     
     for outer_iter in 1:max_outer
@@ -95,7 +100,6 @@ function solve_two_molecule_theory!(
         @printf(">>> OUTER ITERATION %d <<<\n", outer_iter)
         @printf("==================================================\n")
         
-        # --- NEW: Save the solvation potential before inner loop overwrites it ---
         W_solv_old .= W_solv 
         
         println("Generating Single Chains in current Solvation Field...")
@@ -105,16 +109,20 @@ function solve_two_molecule_theory!(
         
         MC_sweeps = 50 * length(configs) 
         
+        # Track inner iteration errors for this outer loop
+        inner_C_errs = T[]
+        inner_δC_steps = T[]
+        
         for inner_iter in 1:max_inner
             @printf("\n  --- Inner Iteration %d ---\n", inner_iter)
             
-            # This overwrites W_solv with the new calculated W_calc(r)
+            C_k_old = copy(C_k) # Save C_k to compute the integration difference
+            
             solve_prism_kspace!(Δ_PRISM, W_solv, C_k, Ω_k, grid, sys_params)
             
             h_sim .= 0.0
             sample_direct!(h_sim, configs, MC_sweeps, start_n, stop_n, chain_params, sys_params, W_solv, grid)
             
-            # --- TRUE TAIL SPLICING ---
             H_PRISM_k = zeros(T, N_sites, N_sites, grid.N)
             for i in 1:grid.N
                 Ω_mat = Ω_k[:, :, i]
@@ -140,29 +148,57 @@ function solve_two_molecule_theory!(
             end
             
             δC = Δ_PRISM .- Δ_Two
-            err = sqrt(sum(δC.^2) / length(δC))
-            @printf("  Convergence Error ||δC|| : %.6e\n", err)
+            
+            # 1. Error Metric: ||δC|| Step Size
+            err_step = sqrt(sum(δC.^2) / length(δC))
+            push!(inner_δC_steps, err_step)
             
             max_step = T(1.0)
-            if err > max_step || isnan(err)
+            if err_step > max_step || isnan(err_step)
                 println("    -> WARNING: Large step detected! Clamping δC.")
-                δC .*= (max_step / err)
+                δC .*= (max_step / err_step)
             end
             
-            # Update C(k)
             C_k .+= mix_inner .* δC
             
-            if err < 1e-5
+            # 2. Error Metric: Integral of Squared Difference for C(k)
+            C_err = T(0.0)
+            for i in 1:N_sites, j in 1:N_sites
+                diff_sq = (C_k[i, j, :] .- C_k_old[i, j, :]).^2
+                C_err += trap_integrate(diff_sq, grid.Δk)
+            end
+            C_err /= (N_sites * N_sites) # Average over the 4 quadrants
+            push!(inner_C_errs, C_err)
+            
+            @printf("  Convergence ||δC|| Step: %.6e | ∫(ΔC_k)² dk: %.6e\n", err_step, C_err)
+            
+            if err_step < 1e-5
                 println("\n  *** INNER LOOP CONVERGED! ***")
                 break
             end
         end
         
-        # --- NEW: Outer Loop Mixing for W(r) ---
-        # Mix the W(r) we started with (W_solv_old) and the W(r) the inner loop just converged to (W_solv)
+        push!(C_err_history, inner_C_errs)
+        push!(δC_step_history, inner_δC_steps)
+        
+        # 3. Error Metric: Integral of Squared Difference for W(r)
+        W_err = T(0.0)
+        for i in 1:N_sites, j in 1:N_sites
+            diff_sq = (W_solv[i, j, :] .- W_solv_old[i, j, :]).^2
+            W_err += trap_integrate(diff_sq, grid.Δr)
+        end
+        W_err /= (N_sites * N_sites)
+        push!(W_err_list, W_err)
+        
+        @printf("\n  Outer Solvation Error ∫(ΔW_r)² dr : %.6e\n", W_err)
+        
         W_solv .= (T(1.0) - mix_outer) .* W_solv_old .+ mix_outer .* W_solv
-        println("  -> Mixed Outer Solvation Potential W(r)")
+        
+        # --- EXPORT DIAGNOSTICS FOR THIS ITERATION ---
+        save_to_csv(@sprintf("W_solv_outer_%02d_err_%.2e.csv", outer_iter, W_err), grid.r, W_solv)
+        save_to_csv(@sprintf("C_k_outer_%02d.csv", outer_iter), grid.k, C_k)
+        save_to_csv(@sprintf("h_r_fixed_outer_%02d.csv", outer_iter), grid.r, h_fixed)
     end
     
-    return C_k, W_solv, h_fixed, configs
+    return C_k, W_solv, h_fixed, configs, W_err_list, C_err_history, δC_step_history
 end
