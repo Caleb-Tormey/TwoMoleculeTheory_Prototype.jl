@@ -63,12 +63,15 @@ function solve_prism_kspace!(
     ifst!(W_solv, W_k, grid)
 end
 
+# src/Solver.jl
+# (Make sure to keep the compute_omega! and solve_prism_kspace! functions at the top of the file as they were)
+
 function solve_two_molecule_theory!(
     sys_params::SystemParameters{T}, chain_params::ChainParameters{T}, grid::RadialGrid{T};
     max_outer::Int = 3, max_inner::Int = 20, mix_inner::T = T(0.05), mix_outer::T = T(0.25)
 ) where {T}
     println("\n==================================================")
-    println("   INITIALIZING TWO-MOLECULE THEORY SOLVER")
+    println("   INITIALIZING TWO-MOLECULE THEORY SOLVER (MDIIS)")
     println("==================================================")
     
     N_sites = sys_params.N_sites
@@ -85,10 +88,14 @@ function solve_two_molecule_theory!(
     gen = PivotGenerator(2500, 400) 
     corrector = DivergenceCorrector(sys_params, chain_params, grid)
     
+    # --- NEW: Initialize the MDIIS Solvers (History length = 5) ---
+    dims = (N_sites, N_sites, grid.N)
+    inner_mdiis = MDIIS_State(5, dims, T)
+    outer_mdiis = MDIIS_State(5, dims, T)
+    
     start_n = 33
     stop_n  = 600
     
-    # --- DIAGNOSTIC TRACKING LISTS ---
     W_err_list = T[]
     C_err_history = Vector{T}[]
     δC_step_history = Vector{T}[]
@@ -102,6 +109,9 @@ function solve_two_molecule_theory!(
         
         W_solv_old .= W_solv 
         
+        # --- NEW: Reset Inner MDIIS history because the chains are about to change! ---
+        reset!(inner_mdiis)
+        
         println("Generating Single Chains in current Solvation Field...")
         configs = generate_configs!(gen, chain_params, sys_params, W_solv, grid)
         
@@ -109,14 +119,13 @@ function solve_two_molecule_theory!(
         
         MC_sweeps = 50 * length(configs) 
         
-        # Track inner iteration errors for this outer loop
         inner_C_errs = T[]
         inner_δC_steps = T[]
         
         for inner_iter in 1:max_inner
             @printf("\n  --- Inner Iteration %d ---\n", inner_iter)
             
-            C_k_old = copy(C_k) # Save C_k to compute the integration difference
+            C_k_old = copy(C_k) 
             
             solve_prism_kspace!(Δ_PRISM, W_solv, C_k, Ω_k, grid, sys_params)
             
@@ -147,9 +156,9 @@ function solve_two_molecule_theory!(
                 Δ_Two[:, :, i] .= -1.0 .* (Ω_inv * H_mat * Ω_inv)
             end
             
+            # The Residual for C(k)
             δC = Δ_PRISM .- Δ_Two
             
-            # 1. Error Metric: ||δC|| Step Size
             err_step = sqrt(sum(δC.^2) / length(δC))
             push!(inner_δC_steps, err_step)
             
@@ -159,15 +168,15 @@ function solve_two_molecule_theory!(
                 δC .*= (max_step / err_step)
             end
             
-            C_k .+= mix_inner .* δC
+            # --- NEW: MDIIS Update for C(k) ---
+            update_MDIIS!(C_k, δC, inner_mdiis, mix_inner)
             
-            # 2. Error Metric: Integral of Squared Difference for C(k)
             C_err = T(0.0)
             for i in 1:N_sites, j in 1:N_sites
                 diff_sq = (C_k[i, j, :] .- C_k_old[i, j, :]).^2
                 C_err += trap_integrate(diff_sq, grid.Δk)
             end
-            C_err /= (N_sites * N_sites) # Average over the 4 quadrants
+            C_err /= (N_sites * N_sites) 
             push!(inner_C_errs, C_err)
             
             @printf("  Convergence ||δC|| Step: %.6e | ∫(ΔC_k)² dk: %.6e\n", err_step, C_err)
@@ -181,10 +190,15 @@ function solve_two_molecule_theory!(
         push!(C_err_history, inner_C_errs)
         push!(δC_step_history, inner_δC_steps)
         
-        # 3. Error Metric: Integral of Squared Difference for W(r)
+        # --- NEW: Outer MDIIS Update for W(r) ---
+        # The inner loop left the newest PRISM solvation potential in W_solv
+        # The residual is the difference between this new potential and the old one
+        δW = W_solv .- W_solv_old
+        
+        # Calculate W(r) Error before MDIIS mangles it
         W_err = T(0.0)
         for i in 1:N_sites, j in 1:N_sites
-            diff_sq = (W_solv[i, j, :] .- W_solv_old[i, j, :]).^2
+            diff_sq = (δW[i, j, :]).^2
             W_err += trap_integrate(diff_sq, grid.Δr)
         end
         W_err /= (N_sites * N_sites)
@@ -192,9 +206,11 @@ function solve_two_molecule_theory!(
         
         @printf("\n  Outer Solvation Error ∫(ΔW_r)² dr : %.6e\n", W_err)
         
-        W_solv .= (T(1.0) - mix_outer) .* W_solv_old .+ mix_outer .* W_solv
+        # We need to put W_solv back to W_solv_old so MDIIS knows where it started
+        W_solv .= W_solv_old
+        update_MDIIS!(W_solv, δW, outer_mdiis, mix_outer)
+        println("  -> MDIIS Updated Outer Solvation Potential W(r)")
         
-        # --- EXPORT DIAGNOSTICS FOR THIS ITERATION ---
         save_to_csv(@sprintf("W_solv_outer_%02d_err_%.2e.csv", outer_iter, W_err), grid.r, W_solv)
         save_to_csv(@sprintf("C_k_outer_%02d.csv", outer_iter), grid.k, C_k)
         save_to_csv(@sprintf("h_r_fixed_outer_%02d.csv", outer_iter), grid.r, h_fixed)

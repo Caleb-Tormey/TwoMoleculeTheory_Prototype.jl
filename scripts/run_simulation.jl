@@ -29,10 +29,10 @@ function main()
     # --- THOROUGH TEST ---
     results = solve_two_molecule_theory!(
         sys, ch_params, grid, 
-        max_outer = 15,       
-        max_inner = 15,      
-        mix_inner = 0.05,    
-        mix_outer = 0.25     
+        max_outer = 4,       
+        max_inner = 10,      
+        mix_inner = 0.1,    
+        mix_outer = 0.30     
     )
     
     C_k, W_solv, h_fixed, configs, W_err_list, C_err_history, δC_history = results

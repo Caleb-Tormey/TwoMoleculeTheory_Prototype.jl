@@ -70,3 +70,15 @@ struct DivergenceCorrector{T<:AbstractFloat}
     begin_idx::Matrix{Int}       
     end_idx::Matrix{Int}         
 end
+# (Append this to the bottom of src/Types.jl)
+
+# ---------------------------------------------------------
+# MDIIS SOLVER TYPES
+# ---------------------------------------------------------
+mutable struct MDIIS_State{T<:AbstractFloat}
+    max_m::Int
+    curr_m::Int
+    head::Int
+    x_hist::Vector{Array{T,3}}
+    R_hist::Vector{Array{T,3}}
+end
