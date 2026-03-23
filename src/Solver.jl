@@ -2,7 +2,7 @@
 
 function compute_omega!(
     Ω_k::Array{T,3}, configs::Vector{Molecule{T}}, grid::RadialGrid{T}, 
-    sys_params::SystemParameters{T}, chain_params::ChainParameters{T} # Added chain_params!
+    sys_params::SystemParameters{T}, chain_params::ChainParameters{T} 
 ) where {T}
     N_sites = sys_params.N_sites
     N_monomers = sys_params.N_monomers
@@ -14,7 +14,6 @@ function compute_omega!(
                 dist = norm(mol[i] - mol[j])
                 idx = round(Int, dist / grid.Δr)
                 if 1 <= idx <= grid.N
-                    # BUG FIXED: Actually map the correct site types!
                     s1 = chain_params.site_types[i]
                     s2 = chain_params.site_types[j]
                     Ω_r_accum[s1, s2, idx] += 1.0
@@ -63,15 +62,13 @@ function solve_prism_kspace!(
     ifst!(W_solv, W_k, grid)
 end
 
-# src/Solver.jl
-# (Make sure to keep the compute_omega! and solve_prism_kspace! functions at the top of the file as they were)
-
 function solve_two_molecule_theory!(
     sys_params::SystemParameters{T}, chain_params::ChainParameters{T}, grid::RadialGrid{T};
-    max_outer::Int = 3, max_inner::Int = 20, mix_inner::T = T(0.05), mix_outer::T = T(0.25)
+    max_outer::Int = 10, max_inner::Int = 20, mix_inner::T = T(0.05), mix_outer::T = T(0.25),
+    burn_in_outer::Int = 2, burn_in_inner::Int = 2
 ) where {T}
     println("\n==================================================")
-    println("   INITIALIZING TWO-MOLECULE THEORY SOLVER (MDIIS)")
+    println("   INITIALIZING TWO-MOLECULE THEORY SOLVER")
     println("==================================================")
     
     N_sites = sys_params.N_sites
@@ -88,10 +85,9 @@ function solve_two_molecule_theory!(
     gen = PivotGenerator(2500, 400) 
     corrector = DivergenceCorrector(sys_params, chain_params, grid)
     
-    # --- NEW: Initialize the MDIIS Solvers (History length = 5) ---
     dims = (N_sites, N_sites, grid.N)
     inner_mdiis = MDIIS_State(5, dims, T)
-    outer_mdiis = MDIIS_State(5, dims, T)
+    outer_mdiis = MDIIS_State(5, dims, T) 
     
     start_n = 33
     stop_n  = 600
@@ -109,7 +105,7 @@ function solve_two_molecule_theory!(
         
         W_solv_old .= W_solv 
         
-        # --- NEW: Reset Inner MDIIS history because the chains are about to change! ---
+        # Reset inner MDIIS history for the new chains
         reset!(inner_mdiis)
         
         println("Generating Single Chains in current Solvation Field...")
@@ -121,6 +117,7 @@ function solve_two_molecule_theory!(
         
         inner_C_errs = T[]
         inner_δC_steps = T[]
+        last_inner_err = T(Inf) 
         
         for inner_iter in 1:max_inner
             @printf("\n  --- Inner Iteration %d ---\n", inner_iter)
@@ -141,7 +138,6 @@ function solve_two_molecule_theory!(
             ifst!(h_PRISM_r, H_PRISM_k, grid)
             
             splice_n = round(Int, 10.0 * chain_params.σ[1] / grid.Δr)
-            
             for i in 1:N_sites, j in 1:N_sites
                 h_sim[i, j, splice_n+1:end] .= h_PRISM_r[i, j, splice_n+1:end]
             end
@@ -156,11 +152,16 @@ function solve_two_molecule_theory!(
                 Δ_Two[:, :, i] .= -1.0 .* (Ω_inv * H_mat * Ω_inv)
             end
             
-            # The Residual for C(k)
             δC = Δ_PRISM .- Δ_Two
-            
             err_step = sqrt(sum(δC.^2) / length(δC))
             push!(inner_δC_steps, err_step)
+            
+            # Flush check: only applies if MDIIS is actually active
+            if err_step > last_inner_err && inner_iter > burn_in_inner + 1
+                println("    -> WARNING: Error increased! Flushing MDIIS history.")
+                reset!(inner_mdiis)
+            end
+            last_inner_err = err_step
             
             max_step = T(1.0)
             if err_step > max_step || isnan(err_step)
@@ -168,8 +169,13 @@ function solve_two_molecule_theory!(
                 δC .*= (max_step / err_step)
             end
             
-            # --- NEW: MDIIS Update for C(k) ---
-            update_MDIIS!(C_k, δC, inner_mdiis, mix_inner)
+            # --- Inner Loop Burn-in Logic ---
+            if inner_iter <= burn_in_inner
+                C_k .+= mix_inner .* δC
+                println("    -> Picard Mixed C(k) (Burn-in)")
+            else
+                update_MDIIS!(C_k, δC, inner_mdiis, mix_inner)
+            end
             
             C_err = T(0.0)
             for i in 1:N_sites, j in 1:N_sites
@@ -190,12 +196,8 @@ function solve_two_molecule_theory!(
         push!(C_err_history, inner_C_errs)
         push!(δC_step_history, inner_δC_steps)
         
-        # --- NEW: Outer MDIIS Update for W(r) ---
-        # The inner loop left the newest PRISM solvation potential in W_solv
-        # The residual is the difference between this new potential and the old one
         δW = W_solv .- W_solv_old
         
-        # Calculate W(r) Error before MDIIS mangles it
         W_err = T(0.0)
         for i in 1:N_sites, j in 1:N_sites
             diff_sq = (δW[i, j, :]).^2
@@ -206,10 +208,14 @@ function solve_two_molecule_theory!(
         
         @printf("\n  Outer Solvation Error ∫(ΔW_r)² dr : %.6e\n", W_err)
         
-        # We need to put W_solv back to W_solv_old so MDIIS knows where it started
-        W_solv .= W_solv_old
-        update_MDIIS!(W_solv, δW, outer_mdiis, mix_outer)
-        println("  -> MDIIS Updated Outer Solvation Potential W(r)")
+        if outer_iter <= burn_in_outer
+            W_solv .= W_solv_old .+ mix_outer .* δW
+            println("  -> Picard Mixed Outer Solvation Potential W(r) (Burn-in)")
+        else
+            W_solv .= W_solv_old
+            update_MDIIS!(W_solv, δW, outer_mdiis, mix_outer)
+            println("  -> MDIIS Updated Outer Solvation Potential W(r)!")
+        end
         
         save_to_csv(@sprintf("W_solv_outer_%02d_err_%.2e.csv", outer_iter, W_err), grid.r, W_solv)
         save_to_csv(@sprintf("C_k_outer_%02d.csv", outer_iter), grid.k, C_k)
