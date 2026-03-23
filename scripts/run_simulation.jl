@@ -3,6 +3,7 @@
 include("../src/TwoMoleculeTheory.jl")
 using StaticArrays
 using Printf
+using Dates # NEW: For timestamping our runs
 
 function save_to_csv(filename::String, grid_vals::Vector{Float64}, data::Array{Float64, 3})
     open(filename, "w") do io
@@ -15,24 +16,19 @@ function save_to_csv(filename::String, grid_vals::Vector{Float64}, data::Array{F
     println("  -> Saved: $filename")
 end
 
-# --- NEW: Function to save the convergence tracking data ---
 function save_convergence_history(filename::String, W_err_list, C_err_hist, dC_hist)
     open(filename, "w") do io
-        # CSV Header
         println(io, "Outer_Iter,Inner_Iter,deltaC_Step,C_k_Error,W_r_Error")
-        
         for out_it in 1:length(C_err_hist)
             num_inner = length(C_err_hist[out_it])
             for in_it in 1:num_inner
                 dc_val = dC_hist[out_it][in_it]
                 c_val = C_err_hist[out_it][in_it]
                 
-                # We only log the W(r) error at the end of the outer loop cycle
                 if in_it == num_inner && out_it <= length(W_err_list)
                     w_val = W_err_list[out_it]
                     @printf(io, "%d,%d,%.6e,%.6e,%.6e\n", out_it, in_it, dc_val, c_val, w_val)
                 else
-                    # Use NaN so plotting software (Excel/Python) leaves a gap
                     @printf(io, "%d,%d,%.6e,%.6e,NaN\n", out_it, in_it, dc_val, c_val)
                 end
             end
@@ -63,14 +59,22 @@ function main()
 
     grid = RadialGrid(2048, 0.1)
 
+    # --- NEW: Build the unique output directory ---
+    timestamp = Dates.format(now(), "yyyymmdd_HHMMSS")
+    out_dir = joinpath("output", "run_$timestamp")
+    println("\n[!] All output for this simulation will be saved to: $out_dir")
+    mkpath(out_dir) # Creates the base folder immediately
+    
+    # Run the 15-iteration Outer test, strictly using Picard (burn_in_outer = 100)
     results = solve_two_molecule_theory!(
         sys, ch_params, grid, 
-        max_outer = 10,       
-        max_inner = 15,      
-        mix_inner = 0.10,    
-        mix_outer = 0.30,
+        max_outer = 3,       
+        max_inner = 3,      
+        mix_inner = 0.05,    
+        mix_outer = 0.25,
         burn_in_inner = 2,
-        burn_in_outer = 2
+        burn_in_outer = 100, 
+        out_dir = out_dir    # Pass our new folder!
     )
     
     C_k, W_solv, h_fixed, configs, W_err_list, C_err_history, δC_history = results
@@ -79,10 +83,9 @@ function main()
     println("   FINAL EXPORT & SUMMARY")
     println("==================================================")
     
-    export_xyz("test_chains_final.xyz", configs[1:10])
-    
-    # Export the consolidated history!
-    save_convergence_history("convergence_history.csv", W_err_list, C_err_history, δC_history)
+    # Save the final summary files right into the base of the run folder
+    export_xyz(joinpath(out_dir, "test_chains_final.xyz"), configs[1:10])
+    save_convergence_history(joinpath(out_dir, "convergence_history.csv"), W_err_list, C_err_history, δC_history)
 end
 
 Base.invokelatest(main)

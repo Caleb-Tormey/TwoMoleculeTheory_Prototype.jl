@@ -65,14 +65,27 @@ end
 function solve_two_molecule_theory!(
     sys_params::SystemParameters{T}, chain_params::ChainParameters{T}, grid::RadialGrid{T};
     max_outer::Int = 10, max_inner::Int = 20, mix_inner::T = T(0.05), mix_outer::T = T(0.25),
-    burn_in_outer::Int = 2, burn_in_inner::Int = 2
+    burn_in_outer::Int = 2, burn_in_inner::Int = 2,
+    initial_W::Union{Array{T,3}, Nothing} = nothing,
+    out_dir::String = "output" # NEW: Directory output parameter
 ) where {T}
     println("\n==================================================")
     println("   INITIALIZING TWO-MOLECULE THEORY SOLVER")
     println("==================================================")
     
+    # --- NEW: Safely create the subfolders ---
+    mkpath(joinpath(out_dir, "Wr"))
+    mkpath(joinpath(out_dir, "Ck"))
+    mkpath(joinpath(out_dir, "hr_fixed"))
+    
     N_sites = sys_params.N_sites
-    W_solv     = zeros(T, N_sites, N_sites, grid.N)
+    W_solv = zeros(T, N_sites, N_sites, grid.N)
+    
+    if initial_W !== nothing
+        println("  -> Loading initial W(r) from checkpoint...")
+        W_solv .= initial_W
+    end
+    
     W_solv_old = zeros(T, N_sites, N_sites, grid.N)
     C_k        = zeros(T, N_sites, N_sites, grid.N)
     Ω_k        = zeros(T, N_sites, N_sites, grid.N)
@@ -104,8 +117,6 @@ function solve_two_molecule_theory!(
         @printf("==================================================\n")
         
         W_solv_old .= W_solv 
-        
-        # Reset inner MDIIS history for the new chains
         reset!(inner_mdiis)
         
         println("Generating Single Chains in current Solvation Field...")
@@ -123,7 +134,6 @@ function solve_two_molecule_theory!(
             @printf("\n  --- Inner Iteration %d ---\n", inner_iter)
             
             C_k_old = copy(C_k) 
-            
             solve_prism_kspace!(Δ_PRISM, W_solv, C_k, Ω_k, grid, sys_params)
             
             h_sim .= 0.0
@@ -156,9 +166,8 @@ function solve_two_molecule_theory!(
             err_step = sqrt(sum(δC.^2) / length(δC))
             push!(inner_δC_steps, err_step)
             
-            # Flush check: only applies if MDIIS is actually active
             if err_step > last_inner_err && inner_iter > burn_in_inner + 1
-                println("    -> WARNING: Error increased! Flushing MDIIS history.")
+                println("    -> WARNING: Error increased! Flushing Inner MDIIS history.")
                 reset!(inner_mdiis)
             end
             last_inner_err = err_step
@@ -169,7 +178,6 @@ function solve_two_molecule_theory!(
                 δC .*= (max_step / err_step)
             end
             
-            # --- Inner Loop Burn-in Logic ---
             if inner_iter <= burn_in_inner
                 C_k .+= mix_inner .* δC
                 println("    -> Picard Mixed C(k) (Burn-in)")
@@ -208,18 +216,25 @@ function solve_two_molecule_theory!(
         
         @printf("\n  Outer Solvation Error ∫(ΔW_r)² dr : %.6e\n", W_err)
         
-        if outer_iter <= burn_in_outer
+        mdiis_threshold = T(1.0) 
+        if outer_iter <= burn_in_outer || W_err > mdiis_threshold
             W_solv .= W_solv_old .+ mix_outer .* δW
-            println("  -> Picard Mixed Outer Solvation Potential W(r) (Burn-in)")
+            if outer_iter > burn_in_outer
+                println("  -> Picard Mixed W(r) (Error above threshold, holding off MDIIS)")
+            else
+                println("  -> Picard Mixed W(r) (Burn-in)")
+            end
+            reset!(outer_mdiis)
         else
             W_solv .= W_solv_old
             update_MDIIS!(W_solv, δW, outer_mdiis, mix_outer)
             println("  -> MDIIS Updated Outer Solvation Potential W(r)!")
         end
         
-        save_to_csv(@sprintf("W_solv_outer_%02d_err_%.2e.csv", outer_iter, W_err), grid.r, W_solv)
-        save_to_csv(@sprintf("C_k_outer_%02d.csv", outer_iter), grid.k, C_k)
-        save_to_csv(@sprintf("h_r_fixed_outer_%02d.csv", outer_iter), grid.r, h_fixed)
+        # --- NEW: Save directly into the subfolders! ---
+        save_to_csv(joinpath(out_dir, "Wr", @sprintf("W_solv_outer_%02d.csv", outer_iter)), grid.r, W_solv)
+        save_to_csv(joinpath(out_dir, "Ck", @sprintf("C_k_outer_%02d.csv", outer_iter)), grid.k, C_k)
+        save_to_csv(joinpath(out_dir, "hr_fixed", @sprintf("h_r_fixed_outer_%02d.csv", outer_iter)), grid.r, h_fixed)
     end
     
     return C_k, W_solv, h_fixed, configs, W_err_list, C_err_history, δC_step_history
