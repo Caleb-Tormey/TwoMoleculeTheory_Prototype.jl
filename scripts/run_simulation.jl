@@ -74,7 +74,8 @@ function main()
         mix_outer = 0.25,
         burn_in_inner = 2,
         burn_in_outer = 100, 
-        out_dir = out_dir    # Pass our new folder!
+        out_dir = out_dir,
+        resume = true    
     )
     
     C_k, W_solv, h_fixed, configs, W_err_list, C_err_history, δC_history = results

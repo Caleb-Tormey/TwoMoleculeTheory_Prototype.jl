@@ -5,6 +5,8 @@ using Random
 using FFTW
 using Printf
 using ProgressMeter
+using Dates
+using JLD2        
 
 # 1. Load Types FIRST 
 include("Types.jl")

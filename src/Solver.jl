@@ -67,25 +67,19 @@ function solve_two_molecule_theory!(
     max_outer::Int = 10, max_inner::Int = 20, mix_inner::T = T(0.05), mix_outer::T = T(0.25),
     burn_in_outer::Int = 2, burn_in_inner::Int = 2,
     initial_W::Union{Array{T,3}, Nothing} = nothing,
-    out_dir::String = "output" # NEW: Directory output parameter
+    out_dir::String = "output",
+    resume::Bool = false  # NEW: Resume flag!
 ) where {T}
     println("\n==================================================")
     println("   INITIALIZING TWO-MOLECULE THEORY SOLVER")
     println("==================================================")
     
-    # --- NEW: Safely create the subfolders ---
     mkpath(joinpath(out_dir, "Wr"))
     mkpath(joinpath(out_dir, "Ck"))
     mkpath(joinpath(out_dir, "hr_fixed"))
     
     N_sites = sys_params.N_sites
-    W_solv = zeros(T, N_sites, N_sites, grid.N)
-    
-    if initial_W !== nothing
-        println("  -> Loading initial W(r) from checkpoint...")
-        W_solv .= initial_W
-    end
-    
+    W_solv     = zeros(T, N_sites, N_sites, grid.N)
     W_solv_old = zeros(T, N_sites, N_sites, grid.N)
     C_k        = zeros(T, N_sites, N_sites, grid.N)
     Ω_k        = zeros(T, N_sites, N_sites, grid.N)
@@ -109,9 +103,30 @@ function solve_two_molecule_theory!(
     C_err_history = Vector{T}[]
     δC_step_history = Vector{T}[]
     
+    start_outer = 1
+    checkpoint_file = joinpath(out_dir, "checkpoint.jld2")
+    
+    # --- NEW: Checkpoint Loading Logic ---
+    if resume && isfile(checkpoint_file)
+        println("  -> [!] RESUMING FROM CHECKPOINT: $checkpoint_file")
+        ckpt = jldopen(checkpoint_file, "r")
+        W_solv .= ckpt["W_solv"]
+        C_k .= ckpt["C_k"]
+        start_outer = ckpt["outer_iter"] + 1
+        W_err_list = ckpt["W_err_list"]
+        C_err_history = ckpt["C_err_history"]
+        δC_step_history = ckpt["dC_step_history"]
+        close(ckpt)
+        println("  -> Picking up at Outer Iteration $start_outer...")
+    elseif initial_W !== nothing
+        println("  -> Loading initial W(r) from provided array...")
+        W_solv .= initial_W
+    end
+    # -------------------------------------
+    
     local configs
     
-    for outer_iter in 1:max_outer
+    for outer_iter in start_outer:max_outer
         @printf("\n==================================================\n")
         @printf(">>> OUTER ITERATION %d <<<\n", outer_iter)
         @printf("==================================================\n")
@@ -231,10 +246,13 @@ function solve_two_molecule_theory!(
             println("  -> MDIIS Updated Outer Solvation Potential W(r)!")
         end
         
-        # --- NEW: Save directly into the subfolders! ---
         save_to_csv(joinpath(out_dir, "Wr", @sprintf("W_solv_outer_%02d.csv", outer_iter)), grid.r, W_solv)
         save_to_csv(joinpath(out_dir, "Ck", @sprintf("C_k_outer_%02d.csv", outer_iter)), grid.k, C_k)
         save_to_csv(joinpath(out_dir, "hr_fixed", @sprintf("h_r_fixed_outer_%02d.csv", outer_iter)), grid.r, h_fixed)
+        
+        # --- NEW: Save the JLD2 Checkpoint ---
+        jldsave(checkpoint_file; W_solv, C_k, outer_iter, W_err_list, C_err_history, dC_step_history=δC_step_history)
+        println("  -> Saved Checkpoint: $checkpoint_file")
     end
     
     return C_k, W_solv, h_fixed, configs, W_err_list, C_err_history, δC_step_history
