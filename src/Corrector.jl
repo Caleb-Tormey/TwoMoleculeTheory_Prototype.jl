@@ -1,10 +1,12 @@
 # src/Corrector.jl
 
+# src/Corrector.jl
+
 function DivergenceCorrector(
     sys_params::SystemParameters{T}, 
     chain_params::ChainParameters{T}, 
     grid::RadialGrid{T}, 
-    sim_dist::T=10.0
+    z_max::T # NEW: We pass the exact dynamic sampling boundary
 ) where {T}
 
     N_sites = sys_params.N_sites
@@ -12,12 +14,13 @@ function DivergenceCorrector(
     end_idx = zeros(Int, N_sites, N_sites)
     
     for i in 1:N_sites, j in 1:N_sites
-        σ_ij = 0.5 * (chain_params.σ[i] + chain_params.σ[j])
-        begin_idx[i, j] = round(Int, σ_ij / grid.Δr) 
-        end_idx[i, j]   = round(Int, sim_dist * σ_ij / grid.Δr)
+        # Start correction just inside the core
+        begin_idx[i, j] = max(1, floor(Int, chain_params.σ[1] / grid.Δr)) 
+        # End correction EXACTLY where direct sampling stops
+        end_idx[i, j]   = min(grid.N, ceil(Int, z_max / grid.Δr))
     end
     
-    sum_rules = [
+    sum_rules =[
         T[1.0 -1.0; -1.0 1.0], 
         T[1.0  0.0; -1.0 0.0],
         T[1.0 -1.0;  0.0 0.0],
@@ -30,7 +33,8 @@ function DivergenceCorrector(
         q_len += (end_idx[i, j] - begin_idx[i, j] + 1)
     end
     
-    q_matrix = zeros(T, length(sum_orders), q_len)
+    # We build the WEIGHTED projection matrix A'
+    q_matrix_weighted = zeros(T, length(sum_orders), q_len)
     
     for g in 1:length(sum_orders)
         n = sum_orders[g]
@@ -43,14 +47,19 @@ function DivergenceCorrector(
             for k in 1:len
                 r_idx = begin_idx[i, j] + k - 1
                 r_val = grid.r[r_idx]
-                q_matrix[g, col_offset + k] = prefactor * (r_val^(n + 2)) * sum_rules[g][i, j]
+                
+                # --- NEW: Spatial Weighting (1 / r^4) ---
+                # This guarantees the pseudoinverse will decay as 1/r^4
+                weight_inv = T(1.0) / (r_val^4)
+                
+                q_matrix_weighted[g, col_offset + k] = prefactor * (r_val^(n + 2)) * sum_rules[g][i, j] * weight_inv
             end
             col_offset += len
         end
     end
     
-    println("Precomputing Moore-Penrose Pseudoinverse for Corrector...")
-    pinv_q = pinv(q_matrix)
+    println("Precomputing Spatially-Weighted Pseudoinverse for Corrector...")
+    pinv_q = pinv(q_matrix_weighted)
     
     return DivergenceCorrector{T}(pinv_q, sum_rules, sum_orders, begin_idx, end_idx)
 end
@@ -75,7 +84,9 @@ function correct_h!(
         end
     end
     
-    q_vec = corrector.pinv_q * RHS
+    # This solves for the transformed variable x
+    x_vec = corrector.pinv_q * RHS
+    
     h_fixed .= h_sim
     
     col_offset = 0
@@ -83,7 +94,13 @@ function correct_h!(
         len = corrector.end_idx[i, j] - corrector.begin_idx[i, j] + 1
         for k in 1:len
             r_idx = corrector.begin_idx[i, j] + k - 1
-            h_fixed[i, j, r_idx] += q_vec[col_offset + k]
+            r_val = grid.r[r_idx]
+            
+            # --- NEW: Transform x back to q using the spatial decay ---
+            # q_i = x_i / r^4. This ensures the correction smoothly hits 0.0!
+            q_val = x_vec[col_offset + k] / (r_val^4)
+            
+            h_fixed[i, j, r_idx] += q_val
         end
         col_offset += len
     end

@@ -68,6 +68,8 @@ function solve_two_molecule_theory!(
     max_outer::Int = 10, max_inner::Int = 20, mix_inner::T = T(0.05), mix_outer::T = T(0.25),
     use_mdiis_inner::Bool = true, burn_in_inner::Int = 2,
     use_mdiis_outer::Bool = false, burn_in_outer::Int = 2,
+    sweep_mult_burnin::Int = 1, sweep_mult_prod::Int = 4, 
+    n_configs::Int = 2500, save_step::Int = 400,           # <--- NEW: Dynamic chain generation!
     initial_W::Union{Array{T,3}, Nothing} = nothing,
     out_dir::String = "output",
     resume::Bool = false
@@ -82,6 +84,12 @@ function solve_two_molecule_theory!(
     
     N_sites = sys_params.N_sites
     W_solv     = zeros(T, N_sites, N_sites, grid.N)
+    
+    if initial_W !== nothing
+        println("  -> Loading initial W(r) from checkpoint...")
+        W_solv .= initial_W
+    end
+    
     W_solv_old = zeros(T, N_sites, N_sites, grid.N)
     C_k        = zeros(T, N_sites, N_sites, grid.N)
     Ω_k        = zeros(T, N_sites, N_sites, grid.N)
@@ -91,8 +99,14 @@ function solve_two_molecule_theory!(
     h_fixed    = zeros(T, N_sites, N_sites, grid.N)
     H_k        = zeros(T, N_sites, N_sites, grid.N)
     
-    gen = PivotGenerator(1250, 400) 
-    corrector = DivergenceCorrector(sys_params, chain_params, grid)
+    # --- FIXED: Use the keyword arguments instead of hardcoded numbers ---
+    gen = PivotGenerator(n_configs, save_step) 
+    # Calculate boundaries FIRST
+    L_max = (sys_params.N_monomers - 1) * chain_params.l_bond
+    z_max = 2.0 * L_max + chain_params.r_cut
+    
+    # Pass z_max so the corrector window matches the dynamic sampling window
+    corrector = DivergenceCorrector(sys_params, chain_params, grid, z_max)
     
     dims = (N_sites, N_sites, grid.N)
     inner_mdiis = MDIIS_State(5, dims, T)
@@ -139,7 +153,11 @@ function solve_two_molecule_theory!(
         
         compute_omega!(Ω_k, configs, grid, sys_params, chain_params) 
         
-        MC_sweeps = 50 * length(configs) 
+        # --- NEW: Dynamic MC Sweeps Logic ---
+        sweep_mult = outer_iter <= burn_in_outer ? sweep_mult_burnin : sweep_mult_prod
+        MC_sweeps = sweep_mult * length(configs) 
+        println("  -> Direct Sampling Sweeps set to: $(MC_sweeps) (Multiplier: $(sweep_mult)x)")
+        # ------------------------------------
         
         inner_C_errs = T[]
         inner_δC_steps = T[]
@@ -162,10 +180,24 @@ function solve_two_molecule_theory!(
             h_PRISM_r = zeros(T, N_sites, N_sites, grid.N)
             ifst!(h_PRISM_r, H_PRISM_k, grid)
             
-            splice_n = round(Int, 10.0 * chain_params.σ[1] / grid.Δr)
-            for i in 1:N_sites, j in 1:N_sites
-                h_sim[i, j, splice_n+1:end] .= h_PRISM_r[i, j, splice_n+1:end]
+            # --- TRUE SIGMOID TAIL SPLICING ---
+            r_c = 10.0 * chain_params.σ[1] # Splice center (~39.3 Å)
+            α_w = 2.0 * chain_params.σ[1]  # Splice transition width (~7.8 Å)
+            
+            for idx in 1:grid.N
+                r = grid.r[idx]
+                
+                # Sigmoid weighting function: 
+                # -> 1.0 at small r (Pure Monte Carlo)
+                # -> 0.0 at large r (Pure PRISM Analytic)
+                # -> 0.5 exactly at r = r_c
+                w_r = T(0.5) * (T(1.0) - tanh((r - r_c) / α_w))
+                
+                for i in 1:N_sites, j in 1:N_sites
+                    h_sim[i, j, idx] = w_r * h_sim[i, j, idx] + (T(1.0) - w_r) * h_PRISM_r[i, j, idx]
+                end
             end
+            # ----------------------------------
             
             correct_h!(h_fixed, h_sim, corrector, grid)
             fst!(H_k, h_fixed, grid)
@@ -193,7 +225,6 @@ function solve_two_molecule_theory!(
                 δC .*= (max_step / err_step)
             end
             
-            # --- EXPLICIT INNER TOGGLE ---
             if (!use_mdiis_inner) || (inner_iter <= burn_in_inner)
                 C_k .+= mix_inner .* δC
                 status_str = use_mdiis_inner ? " (Burn-in)" : ""
@@ -234,7 +265,6 @@ function solve_two_molecule_theory!(
         
         @printf("\n  Outer Solvation Error ∫(ΔW_r)² dr : %.6e\n", W_err)
         
-        # --- EXPLICIT OUTER TOGGLE ---
         if (!use_mdiis_outer) || (outer_iter <= burn_in_outer)
             W_solv .= W_solv_old .+ mix_outer .* δW
             status_str = use_mdiis_outer ? " (Burn-in)" : ""

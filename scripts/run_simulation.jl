@@ -55,14 +55,22 @@ function main()
     
     results = solve_two_molecule_theory!(
         sys, ch_params, grid, 
-        max_outer = 3,       
-        max_inner = 3,      
+        max_outer = 1,       
+        max_inner = 2,      
         mix_inner = 0.05,    
         mix_outer = 0.25,
-        use_mdiis_inner = true,   # <--- Toggled ON
+        use_mdiis_inner = true,   
         burn_in_inner   = 2,
-        use_mdiis_outer = false,  # <--- Toggled OFF (Pure Picard)
-        burn_in_outer   = 2,      # (Ignored if use_mdiis_outer=false)
+        use_mdiis_outer = false,  
+        burn_in_outer   = 2,      
+        
+        # --- NEW: Complete Monte Carlo Resolution Control ---
+        n_configs         = 5000, # e.g., 5000 for production, 500 for testing
+        save_step         = 400,  # steps to decorrelate chains
+        sweep_mult_burnin = 1,    # Fast sampling during burn-in
+        sweep_mult_prod   = 4,    # Deep sampling during production
+        # --------------------------------------------------
+        
         out_dir = out_dir,
         resume = false
     )
