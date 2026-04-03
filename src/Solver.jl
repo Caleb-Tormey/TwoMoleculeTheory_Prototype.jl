@@ -1,4 +1,5 @@
 # src/Solver.jl
+using JLD2
 
 function compute_omega!(
     Ω_k::Array{T,3}, configs::Vector{Molecule{T}}, grid::RadialGrid{T}, 
@@ -65,10 +66,11 @@ end
 function solve_two_molecule_theory!(
     sys_params::SystemParameters{T}, chain_params::ChainParameters{T}, grid::RadialGrid{T};
     max_outer::Int = 10, max_inner::Int = 20, mix_inner::T = T(0.05), mix_outer::T = T(0.25),
-    burn_in_outer::Int = 2, burn_in_inner::Int = 2,
+    use_mdiis_inner::Bool = true, burn_in_inner::Int = 2,
+    use_mdiis_outer::Bool = false, burn_in_outer::Int = 2,
     initial_W::Union{Array{T,3}, Nothing} = nothing,
     out_dir::String = "output",
-    resume::Bool = false  # NEW: Resume flag!
+    resume::Bool = false
 ) where {T}
     println("\n==================================================")
     println("   INITIALIZING TWO-MOLECULE THEORY SOLVER")
@@ -89,7 +91,7 @@ function solve_two_molecule_theory!(
     h_fixed    = zeros(T, N_sites, N_sites, grid.N)
     H_k        = zeros(T, N_sites, N_sites, grid.N)
     
-    gen = PivotGenerator(2500, 400) 
+    gen = PivotGenerator(1250, 400) 
     corrector = DivergenceCorrector(sys_params, chain_params, grid)
     
     dims = (N_sites, N_sites, grid.N)
@@ -106,7 +108,6 @@ function solve_two_molecule_theory!(
     start_outer = 1
     checkpoint_file = joinpath(out_dir, "checkpoint.jld2")
     
-    # --- NEW: Checkpoint Loading Logic ---
     if resume && isfile(checkpoint_file)
         println("  -> [!] RESUMING FROM CHECKPOINT: $checkpoint_file")
         ckpt = jldopen(checkpoint_file, "r")
@@ -122,7 +123,6 @@ function solve_two_molecule_theory!(
         println("  -> Loading initial W(r) from provided array...")
         W_solv .= initial_W
     end
-    # -------------------------------------
     
     local configs
     
@@ -181,7 +181,7 @@ function solve_two_molecule_theory!(
             err_step = sqrt(sum(δC.^2) / length(δC))
             push!(inner_δC_steps, err_step)
             
-            if err_step > last_inner_err && inner_iter > burn_in_inner + 1
+            if use_mdiis_inner && err_step > last_inner_err && inner_iter > burn_in_inner + 1
                 println("    -> WARNING: Error increased! Flushing Inner MDIIS history.")
                 reset!(inner_mdiis)
             end
@@ -193,11 +193,14 @@ function solve_two_molecule_theory!(
                 δC .*= (max_step / err_step)
             end
             
-            if inner_iter <= burn_in_inner
+            # --- EXPLICIT INNER TOGGLE ---
+            if (!use_mdiis_inner) || (inner_iter <= burn_in_inner)
                 C_k .+= mix_inner .* δC
-                println("    -> Picard Mixed C(k) (Burn-in)")
+                status_str = use_mdiis_inner ? " (Burn-in)" : ""
+                println("    -> Picard Mixed C(k)$status_str")
             else
                 update_MDIIS!(C_k, δC, inner_mdiis, mix_inner)
+                println("    -> MDIIS Updated C(k)")
             end
             
             C_err = T(0.0)
@@ -231,14 +234,11 @@ function solve_two_molecule_theory!(
         
         @printf("\n  Outer Solvation Error ∫(ΔW_r)² dr : %.6e\n", W_err)
         
-        mdiis_threshold = T(1.0) 
-        if outer_iter <= burn_in_outer || W_err > mdiis_threshold
+        # --- EXPLICIT OUTER TOGGLE ---
+        if (!use_mdiis_outer) || (outer_iter <= burn_in_outer)
             W_solv .= W_solv_old .+ mix_outer .* δW
-            if outer_iter > burn_in_outer
-                println("  -> Picard Mixed W(r) (Error above threshold, holding off MDIIS)")
-            else
-                println("  -> Picard Mixed W(r) (Burn-in)")
-            end
+            status_str = use_mdiis_outer ? " (Burn-in)" : ""
+            println("  -> Picard Mixed Outer Solvation Potential W(r)$status_str")
             reset!(outer_mdiis)
         else
             W_solv .= W_solv_old
@@ -250,7 +250,6 @@ function solve_two_molecule_theory!(
         save_to_csv(joinpath(out_dir, "Ck", @sprintf("C_k_outer_%02d.csv", outer_iter)), grid.k, C_k)
         save_to_csv(joinpath(out_dir, "hr_fixed", @sprintf("h_r_fixed_outer_%02d.csv", outer_iter)), grid.r, h_fixed)
         
-        # --- NEW: Save the JLD2 Checkpoint ---
         jldsave(checkpoint_file; W_solv, C_k, outer_iter, W_err_list, C_err_history, dC_step_history=δC_step_history)
         println("  -> Saved Checkpoint: $checkpoint_file")
     end

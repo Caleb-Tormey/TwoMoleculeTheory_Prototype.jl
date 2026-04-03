@@ -38,44 +38,33 @@ function save_convergence_history(filename::String, W_err_list, C_err_hist, dC_h
 end
 
 function main()
-    sys = SystemParameters(
-        405.0, 
-        0.001985875, 
-        0.03123, 
-        2, 
-        24
-    )
-
+    sys = SystemParameters(405.0, 0.001985875, 0.03123, 2, 24)
     ch_params = ChainParameters(
-        1.54, 
-        124.18, 
-        114.0 * π / 180.0, 
+        1.54, 124.18, 114.0 * π / 180.0, 
         SVector(2.007, 4.012, 0.271, -6.290), 
-        SVector(3.93, 3.93), 
-        SVector(0.07398, 0.07398), 
-        1.1225 * 3.93, 
-        0.0,[i % 2 == 1 ? 1 : 2 for i in 1:24] 
+        SVector(3.93, 3.93), SVector(0.07398, 0.07398), 
+        1.1225 * 3.93, 0.0,[i % 2 == 1 ? 1 : 2 for i in 1:24] 
     )
 
     grid = RadialGrid(2048, 0.1)
 
-    # --- NEW: Build the unique output directory ---
     timestamp = Dates.format(now(), "yyyymmdd_HHMMSS")
     out_dir = joinpath("output", "run_$timestamp")
     println("\n[!] All output for this simulation will be saved to: $out_dir")
-    mkpath(out_dir) # Creates the base folder immediately
+    mkpath(out_dir) 
     
-    # Run the 15-iteration Outer test, strictly using Picard (burn_in_outer = 100)
     results = solve_two_molecule_theory!(
         sys, ch_params, grid, 
         max_outer = 3,       
         max_inner = 3,      
         mix_inner = 0.05,    
         mix_outer = 0.25,
-        burn_in_inner = 2,
-        burn_in_outer = 100, 
+        use_mdiis_inner = true,   # <--- Toggled ON
+        burn_in_inner   = 2,
+        use_mdiis_outer = false,  # <--- Toggled OFF (Pure Picard)
+        burn_in_outer   = 2,      # (Ignored if use_mdiis_outer=false)
         out_dir = out_dir,
-        resume = true    
+        resume = false
     )
     
     C_k, W_solv, h_fixed, configs, W_err_list, C_err_history, δC_history = results
@@ -84,7 +73,6 @@ function main()
     println("   FINAL EXPORT & SUMMARY")
     println("==================================================")
     
-    # Save the final summary files right into the base of the run folder
     export_xyz(joinpath(out_dir, "test_chains_final.xyz"), configs[1:10])
     save_convergence_history(joinpath(out_dir, "convergence_history.csv"), W_err_list, C_err_history, δC_history)
 end
