@@ -69,7 +69,8 @@ function solve_two_molecule_theory!(
     use_mdiis_inner::Bool = true, burn_in_inner::Int = 2,
     use_mdiis_outer::Bool = false, burn_in_outer::Int = 2,
     sweep_mult_burnin::Int = 1, sweep_mult_prod::Int = 4, 
-    n_configs::Int = 2500, save_step::Int = 400,           # <--- NEW: Dynamic chain generation!
+    n_configs::Int = 2500, save_step::Int = 400,           
+    use_attractive_lj::Bool = false, lj_ramp_iters::Int = 5, # NEW: The LJ toggles
     initial_W::Union{Array{T,3}, Nothing} = nothing,
     out_dir::String = "output",
     resume::Bool = false
@@ -99,21 +100,19 @@ function solve_two_molecule_theory!(
     h_fixed    = zeros(T, N_sites, N_sites, grid.N)
     H_k        = zeros(T, N_sites, N_sites, grid.N)
     
-    # --- FIXED: Use the keyword arguments instead of hardcoded numbers ---
     gen = PivotGenerator(n_configs, save_step) 
-    # Calculate boundaries FIRST
+    
+    # We use the absolute maximum target r_cut to set the z_max boundaries permanently
     L_max = (sys_params.N_monomers - 1) * chain_params.l_bond
     z_max = 2.0 * L_max + chain_params.r_cut
-    
-    # Pass z_max so the corrector window matches the dynamic sampling window
     corrector = DivergenceCorrector(sys_params, chain_params, grid, z_max)
     
     dims = (N_sites, N_sites, grid.N)
     inner_mdiis = MDIIS_State(5, dims, T)
     outer_mdiis = MDIIS_State(5, dims, T) 
     
-    start_n = 33
-    stop_n  = 600
+    start_n = max(1, floor(Int, chain_params.σ[1] / grid.Δr))
+    stop_n  = min(grid.N, ceil(Int, z_max / grid.Δr))
     
     W_err_list = T[]
     C_err_history = Vector{T}[]
@@ -145,19 +144,41 @@ function solve_two_molecule_theory!(
         @printf(">>> OUTER ITERATION %d <<<\n", outer_iter)
         @printf("==================================================\n")
         
+        # --- NEW: Calculate current_r_cut and current_shift! ---
+        σ_val = chain_params.σ[1]
+        ϵ_val = chain_params.ϵ[1]
+        r_min = T(1.1224620483) * σ_val # 2^(1/6) * sigma (WCA Minimum)
+        
+        current_r_cut = r_min
+        if use_attractive_lj
+            target_r_cut = chain_params.r_cut
+            if outer_iter >= lj_ramp_iters || lj_ramp_iters <= 1
+                current_r_cut = target_r_cut
+            else
+                fraction = min(T(1.0), T(outer_iter - 1) / T(lj_ramp_iters - 1))
+                current_r_cut = r_min + fraction * (target_r_cut - r_min)
+            end
+            @printf("  -> LJ Interaction: r_cut = %.3f Å\n", current_r_cut)
+        else
+            @printf("  -> Purely Repulsive WCA Interaction: r_cut = %.3f Å\n", current_r_cut)
+        end
+        
+        # Compute the energy shift so the potential is perfectly continuous at r_cut
+        term_cut = (σ_val / current_r_cut)^6
+        current_shift = T(4.0) * ϵ_val * (term_cut^2 - term_cut + T(0.25))
+        # ---------------------------------------------------------
+
         W_solv_old .= W_solv 
         reset!(inner_mdiis)
         
         println("Generating Single Chains in current Solvation Field...")
-        configs = generate_configs!(gen, chain_params, sys_params, W_solv, grid)
+        configs = generate_configs!(gen, chain_params, sys_params, W_solv, grid, current_r_cut, current_shift)
         
         compute_omega!(Ω_k, configs, grid, sys_params, chain_params) 
         
-        # --- NEW: Dynamic MC Sweeps Logic ---
         sweep_mult = outer_iter <= burn_in_outer ? sweep_mult_burnin : sweep_mult_prod
         MC_sweeps = sweep_mult * length(configs) 
         println("  -> Direct Sampling Sweeps set to: $(MC_sweeps) (Multiplier: $(sweep_mult)x)")
-        # ------------------------------------
         
         inner_C_errs = T[]
         inner_δC_steps = T[]
@@ -170,7 +191,7 @@ function solve_two_molecule_theory!(
             solve_prism_kspace!(Δ_PRISM, W_solv, C_k, Ω_k, grid, sys_params)
             
             h_sim .= 0.0
-            sample_direct!(h_sim, configs, MC_sweeps, start_n, stop_n, chain_params, sys_params, W_solv, grid)
+            sample_direct!(h_sim, configs, MC_sweeps, start_n, stop_n, chain_params, sys_params, W_solv, grid, current_r_cut, current_shift)
             
             H_PRISM_k = zeros(T, N_sites, N_sites, grid.N)
             for i in 1:grid.N
@@ -180,24 +201,17 @@ function solve_two_molecule_theory!(
             h_PRISM_r = zeros(T, N_sites, N_sites, grid.N)
             ifst!(h_PRISM_r, H_PRISM_k, grid)
             
-            # --- TRUE SIGMOID TAIL SPLICING ---
-            r_c = 10.0 * chain_params.σ[1] # Splice center (~39.3 Å)
-            α_w = 2.0 * chain_params.σ[1]  # Splice transition width (~7.8 Å)
+            r_c = 10.0 * chain_params.σ[1] 
+            α_w = 2.0 * chain_params.σ[1]  
             
             for idx in 1:grid.N
                 r = grid.r[idx]
-                
-                # Sigmoid weighting function: 
-                # -> 1.0 at small r (Pure Monte Carlo)
-                # -> 0.0 at large r (Pure PRISM Analytic)
-                # -> 0.5 exactly at r = r_c
                 w_r = T(0.5) * (T(1.0) - tanh((r - r_c) / α_w))
                 
                 for i in 1:N_sites, j in 1:N_sites
                     h_sim[i, j, idx] = w_r * h_sim[i, j, idx] + (T(1.0) - w_r) * h_PRISM_r[i, j, idx]
                 end
             end
-            # ----------------------------------
             
             correct_h!(h_fixed, h_sim, corrector, grid)
             fst!(H_k, h_fixed, grid)

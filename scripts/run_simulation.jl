@@ -40,10 +40,15 @@ end
 function main()
     sys = SystemParameters(405.0, 0.001985875, 0.03123, 2, 24)
     ch_params = ChainParameters(
-        1.54, 124.18, 114.0 * π / 180.0, 
+        1.54, 
+        124.18, 
+        114.0 * π / 180.0, 
         SVector(2.007, 4.012, 0.271, -6.290), 
-        SVector(3.93, 3.93), SVector(0.07398, 0.07398), 
-        1.1225 * 3.93, 0.0,[i % 2 == 1 ? 1 : 2 for i in 1:24] 
+        SVector(3.93, 3.93), 
+        SVector(0.07398, 0.07398), 
+        10.0 * 3.93,   # <--- Make sure r_cut is large enough to see the attractive tail!
+        0.0,
+        [i % 2 == 1 ? 1 : 2 for i in 1:24] 
     )
 
     grid = RadialGrid(2048, 0.1)
@@ -55,8 +60,8 @@ function main()
     
     results = solve_two_molecule_theory!(
         sys, ch_params, grid, 
-        max_outer = 1,       
-        max_inner = 2,      
+        max_outer = 3,       
+        max_inner = 1,      
         mix_inner = 0.05,    
         mix_outer = 0.25,
         use_mdiis_inner = true,   
@@ -71,6 +76,9 @@ function main()
         sweep_mult_prod   = 4,    # Deep sampling during production
         # --------------------------------------------------
         
+        use_attractive_lj = true, # <--- TOGGLE THIS!
+        lj_ramp_iters     = 5,    # <--- How many outer loops it takes to reach λ = 1.0
+
         out_dir = out_dir,
         resume = false
     )
