@@ -210,7 +210,9 @@ end
 function ThreadWorkspace(N_monomers::Int, N_sites::Int, N_grid::Int, ::Type{T}) where {T}
     return ThreadWorkspace{T}(
         Vector{Monomer{T}}(undef, N_monomers), Vector{Monomer{T}}(undef, N_monomers),
-        zeros(Int, N_monomers, N_monomers), zeros(T, N_sites, N_sites, N_grid)
+        zeros(Int, N_monomers, N_monomers), 
+        zeros(T, N_sites, N_sites, N_grid),
+        zeros(T, N_sites, N_sites, N_grid) # Initialize n(r) accumulator
     )
 end
 
@@ -292,7 +294,11 @@ function sample_direct!(
             s2_idx = rand(rng, 1:N_monomers)
             
             E_inter = evaluate_two_chain!(ws, mol1, mol2, s1_idx, s2_idx, z_shift, rng, chain_params, W_solv, grid)
+            
+            # 1. The interacting weight f(r)
             weight = (n^2) * exp(-β * E_inter)
+            # 2. The ideal non-interacting weight n(r)
+            norm_weight = T(n^2) 
             
             @inbounds for i in 1:N_monomers, j in 1:N_monomers
                 dist_idx = ws.dist_indices[i, j]
@@ -300,29 +306,29 @@ function sample_direct!(
                 s2 = chain_params.site_types[j]
                 
                 ws.g_r_accum[s1, s2, dist_idx] += weight
+                ws.n_r_accum[s1, s2, dist_idx] += norm_weight # Track baseline!
             end
         end
         ProgressMeter.next!(prog)
     end
     ProgressMeter.finish!(prog)
     
+    # Consolidate thread accumulators
     h_sim .= 0.0
+    n_sim = zeros(T, sys_params.N_sites, sys_params.N_sites, grid.N)
+    
     for ws in workspaces
         h_sim .+= ws.g_r_accum
+        n_sim .+= ws.n_r_accum
     end
     
-    # At the bottom of sample_direct!
-    norm_const = 144.0  
-    
-    # Safe limit: 10 * sigma
-    splice_n = round(Int, 10.0 * chain_params.σ[1] / grid.Δr)
-
+    # --- NEW: Exact Monte Carlo Normalization ---
     for i in 1:sys_params.N_sites, j in 1:sys_params.N_sites, k in 1:grid.N
-        if k <= splice_n
-            g_val = h_sim[i, j, k] / (k^2 * MC_steps * norm_const)
+        if n_sim[i, j, k] > 0.0
+            g_val = h_sim[i, j, k] / n_sim[i, j, k]
             h_sim[i, j, k] = g_val - 1.0 
         else
-            h_sim[i, j, k] = 0.0 # Will be overwritten by PRISM tail
+            h_sim[i, j, k] = 0.0
         end
     end
 end

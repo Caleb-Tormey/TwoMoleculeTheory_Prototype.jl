@@ -58,6 +58,7 @@ struct ThreadWorkspace{T<:AbstractFloat}
     mol2_shifted::Molecule{T}
     dist_indices::Matrix{Int}   
     g_r_accum::Array{T, 3}      
+    n_r_accum::Array{T, 3}      # NEW: Tracks the unweighted baseline!
 end
 
 # ---------------------------------------------------------
