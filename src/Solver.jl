@@ -32,6 +32,16 @@ function compute_omega!(
         end
     end
     
+    for i in 1:(N_sites - 1)
+        for j in (i + 1):N_sites
+            for idx in 1:grid.N
+                avg_val = T(0.5) * (Ω_r[i, j, idx] + Ω_r[j, i, idx])
+                Ω_r[i, j, idx] = avg_val
+                Ω_r[j, i, idx] = avg_val
+            end
+        end
+    end
+    
     fst!(Ω_k, Ω_r, grid)
     for idx in 1:grid.N, i in 1:N_sites
         Ω_k[i, i, idx] += T(1.0)
@@ -44,9 +54,7 @@ function solve_prism_kspace!(
 ) where {T}
     N_sites = sys_params.N_sites
     I_mat = Matrix{T}(I, N_sites, N_sites)
-    
     ρ_mat = I_mat .* (sys_params.ρ / N_sites)
-    
     W_k = zeros(T, N_sites, N_sites, grid.N)
     
     for i in 1:grid.N
@@ -65,12 +73,14 @@ end
 
 function solve_two_molecule_theory!(
     sys_params::SystemParameters{T}, chain_params::ChainParameters{T}, grid::RadialGrid{T};
-    max_outer::Int = 10, max_inner::Int = 20, mix_inner::T = T(0.05), mix_outer::T = T(0.25),
-    use_mdiis_inner::Bool = true, burn_in_inner::Int = 2,
-    use_mdiis_outer::Bool = false, burn_in_outer::Int = 2,
+    max_outer::Int = 10, max_inner::Int = 20, mix_inner::T = T(0.10), mix_outer::T = T(0.20),
+    use_mdiis_inner::Bool = true, burn_in_inner::Int = 3,
+    use_mdiis_outer::Bool = false, burn_in_outer::Int = 100,
     sweep_mult_burnin::Int = 1, sweep_mult_prod::Int = 4, 
+    sweep_transition_iter::Int = 5, # <--- NEW: You control when to shift gears!
     n_configs::Int = 2500, save_step::Int = 400,           
-    use_attractive_lj::Bool = false, lj_ramp_iters::Int = 5, # NEW: The LJ toggles
+    use_attractive_lj::Bool = false, lj_ramp_iters::Int = 5, 
+    inner_tol::T = T(1e-5), outer_tol::T = T(1e-4), 
     initial_W::Union{Array{T,3}, Nothing} = nothing,
     out_dir::String = "output",
     resume::Bool = false
@@ -102,7 +112,6 @@ function solve_two_molecule_theory!(
     
     gen = PivotGenerator(n_configs, save_step) 
     
-    # We use the absolute maximum target r_cut to set the z_max boundaries permanently
     L_max = (sys_params.N_monomers - 1) * chain_params.l_bond
     z_max = 2.0 * L_max + chain_params.r_cut
     corrector = DivergenceCorrector(sys_params, chain_params, grid, z_max)
@@ -132,9 +141,6 @@ function solve_two_molecule_theory!(
         δC_step_history = ckpt["dC_step_history"]
         close(ckpt)
         println("  -> Picking up at Outer Iteration $start_outer...")
-    elseif initial_W !== nothing
-        println("  -> Loading initial W(r) from provided array...")
-        W_solv .= initial_W
     end
     
     local configs
@@ -144,10 +150,9 @@ function solve_two_molecule_theory!(
         @printf(">>> OUTER ITERATION %d <<<\n", outer_iter)
         @printf("==================================================\n")
         
-        # --- NEW: Calculate current_r_cut and current_shift! ---
         σ_val = chain_params.σ[1]
         ϵ_val = chain_params.ϵ[1]
-        r_min = T(1.1224620483) * σ_val # 2^(1/6) * sigma (WCA Minimum)
+        r_min = T(1.1224620483) * σ_val 
         
         current_r_cut = r_min
         if use_attractive_lj
@@ -163,10 +168,8 @@ function solve_two_molecule_theory!(
             @printf("  -> Purely Repulsive WCA Interaction: r_cut = %.3f Å\n", current_r_cut)
         end
         
-        # Compute the energy shift so the potential is perfectly continuous at r_cut
         term_cut = (σ_val / current_r_cut)^6
         current_shift = T(4.0) * ϵ_val * (term_cut^2 - term_cut + T(0.25))
-        # ---------------------------------------------------------
 
         W_solv_old .= W_solv 
         reset!(inner_mdiis)
@@ -176,13 +179,17 @@ function solve_two_molecule_theory!(
         
         compute_omega!(Ω_k, configs, grid, sys_params, chain_params) 
         
-        sweep_mult = outer_iter <= burn_in_outer ? sweep_mult_burnin : sweep_mult_prod
+        sweep_mult = outer_iter <= sweep_transition_iter ? sweep_mult_burnin : sweep_mult_prod
         MC_sweeps = sweep_mult * length(configs) 
         println("  -> Direct Sampling Sweeps set to: $(MC_sweeps) (Multiplier: $(sweep_mult)x)")
         
         inner_C_errs = T[]
         inner_δC_steps = T[]
         last_inner_err = T(Inf) 
+        
+        # --- NEW: Dynamic Inner Tolerance ---
+        # Starts loose (1e-3) and tightens by an order of magnitude each outer iteration until it hits inner_tol
+        current_inner_tol = max(inner_tol, T(1e-3) / T(10^(outer_iter - 1)))
         
         for inner_iter in 1:max_inner
             @printf("\n  --- Inner Iteration %d ---\n", inner_iter)
@@ -227,8 +234,10 @@ function solve_two_molecule_theory!(
             err_step = sqrt(sum(δC.^2) / length(δC))
             push!(inner_δC_steps, err_step)
             
-            if use_mdiis_inner && err_step > last_inner_err && inner_iter > burn_in_inner + 1
-                println("    -> WARNING: Error increased! Flushing Inner MDIIS history.")
+            # --- NEW: Relaxed MDIIS Flush (Tolerates a 20% noise spike) ---
+            noise_tolerance = T(1.20)
+            if use_mdiis_inner && err_step > (last_inner_err * noise_tolerance) && inner_iter > burn_in_inner + 1
+                println("    -> WARNING: Error spiked! Flushing Inner MDIIS history.")
                 reset!(inner_mdiis)
             end
             last_inner_err = err_step
@@ -258,8 +267,9 @@ function solve_two_molecule_theory!(
             
             @printf("  Convergence ||δC|| Step: %.6e | ∫(ΔC_k)² dk: %.6e\n", err_step, C_err)
             
-            if err_step < 1e-5
-                println("\n  *** INNER LOOP CONVERGED! ***")
+            # --- NEW: Dynamic Tolerance Break ---
+            if err_step < current_inner_tol
+                @printf("\n  *** INNER LOOP CONVERGED (Tol: %.1e)! ***\n", current_inner_tol)
                 break
             end
         end
@@ -279,6 +289,12 @@ function solve_two_molecule_theory!(
         
         @printf("\n  Outer Solvation Error ∫(ΔW_r)² dr : %.6e\n", W_err)
         
+        # --- NEW: Outer Loop Convergence Check ---
+        if W_err < outer_tol
+            @printf("\n*** OUTER LOOP CONVERGED (Tol: %.1e)! ***\n", outer_tol)
+            break
+        end
+        
         if (!use_mdiis_outer) || (outer_iter <= burn_in_outer)
             W_solv .= W_solv_old .+ mix_outer .* δW
             status_str = use_mdiis_outer ? " (Burn-in)" : ""
@@ -295,7 +311,6 @@ function solve_two_molecule_theory!(
         save_to_csv(joinpath(out_dir, "hr_fixed", @sprintf("h_r_fixed_outer_%02d.csv", outer_iter)), grid.r, h_fixed)
         
         jldsave(checkpoint_file; W_solv, C_k, outer_iter, W_err_list, C_err_history, dC_step_history=δC_step_history)
-        println("  -> Saved Checkpoint: $checkpoint_file")
     end
     
     return C_k, W_solv, h_fixed, configs, W_err_list, C_err_history, δC_step_history

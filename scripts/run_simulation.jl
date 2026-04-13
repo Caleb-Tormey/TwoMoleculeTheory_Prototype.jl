@@ -3,7 +3,7 @@
 include("../src/TwoMoleculeTheory.jl")
 using StaticArrays
 using Printf
-using Dates # NEW: For timestamping our runs
+using Dates
 
 function save_to_csv(filename::String, grid_vals::Vector{Float64}, data::Array{Float64, 3})
     open(filename, "w") do io
@@ -39,46 +39,44 @@ end
 
 function main()
     sys = SystemParameters(405.0, 0.001985875, 0.03123, 2, 24)
+
     ch_params = ChainParameters(
-        1.54, 
-        124.18, 
-        114.0 * π / 180.0, 
+        1.54, 124.18, 114.0 * π / 180.0, 
         SVector(2.007, 4.012, 0.271, -6.290), 
-        SVector(3.93, 3.93), 
-        SVector(0.07398, 0.07398), 
-        10.0 * 3.93,   # <--- Make sure r_cut is large enough to see the attractive tail!
-        0.0,
-        [i % 2 == 1 ? 1 : 2 for i in 1:24] 
+        SVector(3.93, 3.93), SVector(0.07398, 0.07398), 
+        10.0 * 3.93, # Maximum possible r_cut
+        0.0,[i % 2 == 1 ? 1 : 2 for i in 1:24] 
     )
 
     grid = RadialGrid(2048, 0.1)
 
     timestamp = Dates.format(now(), "yyyymmdd_HHMMSS")
-    out_dir = joinpath("output", "run_$timestamp")
+    out_dir = joinpath("output", "wca_benchmark_$timestamp")
     println("\n[!] All output for this simulation will be saved to: $out_dir")
     mkpath(out_dir) 
     
+    # --- PHASE 1: WCA Benchmark ---
     results = solve_two_molecule_theory!(
         sys, ch_params, grid, 
-        max_outer = 3,       
-        max_inner = 1,      
-        mix_inner = 0.05,    
-        mix_outer = 0.25,
+        
+        max_outer = 12,       
+        max_inner = 30,      
+        mix_inner = 0.15,    
+        mix_outer = 0.20,
+        
         use_mdiis_inner = true,   
-        burn_in_inner   = 2,
+        burn_in_inner   = 3,
         use_mdiis_outer = false,  
-        burn_in_outer   = 2,      
+        burn_in_outer   = 100,      
         
-        # --- NEW: Complete Monte Carlo Resolution Control ---
-        n_configs         = 5000, # e.g., 5000 for production, 500 for testing
-        save_step         = 400,  # steps to decorrelate chains
-        sweep_mult_burnin = 1,    # Fast sampling during burn-in
-        sweep_mult_prod   = 4,    # Deep sampling during production
-        # --------------------------------------------------
+        n_configs         = 5000, 
+        save_step         = 400,
+        sweep_mult_burnin = 1,    
+        sweep_mult_prod   = 4,    
+        sweep_transition_iter = 5, # <--- Fast for loops 1-5, Deep precision for 6+
         
-        use_attractive_lj = true, # <--- TOGGLE THIS!
-        lj_ramp_iters     = 5,    # <--- How many outer loops it takes to reach λ = 1.0
-
+        use_attractive_lj = false,
+        
         out_dir = out_dir,
         resume = false
     )

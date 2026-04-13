@@ -279,7 +279,7 @@ function sample_direct!(
     h_sim::Array{T,3}, configs::Vector{Molecule{T}}, MC_steps::Int, 
     start_n::Int, stop_n::Int, chain_params::ChainParameters{T}, 
     sys_params::SystemParameters{T}, W_solv::Array{T,3}, grid::RadialGrid{T}, 
-    current_r_cut::T, current_shift::T # NEW: Dynamic cutoff
+    current_r_cut::T, current_shift::T
 ) where {T}
     N_configs = length(configs)
     N_monomers = sys_params.N_monomers
@@ -336,6 +336,18 @@ function sample_direct!(
             h_sim[i, j, k] = 0.0
         end
     end
+    
+    # --- NEW: Explicit Symmetrization of Off-Diagonals ---
+    for i in 1:(sys_params.N_sites - 1)
+        for j in (i + 1):sys_params.N_sites
+            for k in 1:grid.N
+                avg_val = T(0.5) * (h_sim[i, j, k] + h_sim[j, i, k])
+                h_sim[i, j, k] = avg_val
+                h_sim[j, i, k] = avg_val
+            end
+        end
+    end
+    # -----------------------------------------------------
 end
 
 function export_xyz(filename::String, configs::Vector{Molecule{T}}) where {T}
