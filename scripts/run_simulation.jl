@@ -59,21 +59,24 @@ function main()
     results = solve_two_molecule_theory!(
         sys, ch_params, grid, 
         
-        max_outer = 12,       
+        max_outer = 2020,       
         max_inner = 30,      
-        mix_inner = 0.15,    
-        mix_outer = 0.20,
+        
+        # --- NEW DYNAMIC MIXING ---
+        mix_inner_burnin = 0.15, # Fast steps to dig the potential
+        mix_inner_prod   = 0.05, # Cautious steps for high precision
+        mix_outer        = 0.20,
         
         use_mdiis_inner = true,   
         burn_in_inner   = 3,
         use_mdiis_outer = false,  
         burn_in_outer   = 100,      
         
-        n_configs         = 5000, 
+        n_configs         = 20000, 
         save_step         = 400,
         sweep_mult_burnin = 1,    
         sweep_mult_prod   = 4,    
-        sweep_transition_iter = 5, # <--- Fast for loops 1-5, Deep precision for 6+
+        sweep_transition_iter = 10, 
         
         use_attractive_lj = false,
         

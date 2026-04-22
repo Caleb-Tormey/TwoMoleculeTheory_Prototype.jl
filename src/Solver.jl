@@ -73,11 +73,12 @@ end
 
 function solve_two_molecule_theory!(
     sys_params::SystemParameters{T}, chain_params::ChainParameters{T}, grid::RadialGrid{T};
-    max_outer::Int = 10, max_inner::Int = 20, mix_inner::T = T(0.10), mix_outer::T = T(0.20),
+    max_outer::Int = 10, max_inner::Int = 20, mix_outer::T = T(0.20),
+    mix_inner_burnin::T = T(0.15), mix_inner_prod::T = T(0.05), # NEW: Dynamic Mixing Parameters!
     use_mdiis_inner::Bool = true, burn_in_inner::Int = 3,
     use_mdiis_outer::Bool = false, burn_in_outer::Int = 100,
     sweep_mult_burnin::Int = 1, sweep_mult_prod::Int = 4, 
-    sweep_transition_iter::Int = 5, # <--- NEW: You control when to shift gears!
+    sweep_transition_iter::Int = 5,
     n_configs::Int = 2500, save_step::Int = 400,           
     use_attractive_lj::Bool = false, lj_ramp_iters::Int = 5, 
     inner_tol::T = T(1e-5), outer_tol::T = T(1e-4), 
@@ -183,13 +184,16 @@ function solve_two_molecule_theory!(
         MC_sweeps = sweep_mult * length(configs) 
         println("  -> Direct Sampling Sweeps set to: $(MC_sweeps) (Multiplier: $(sweep_mult)x)")
         
+        # --- NEW: Dynamic Mixing Logic ---
+        mix_inner = outer_iter <= sweep_transition_iter ? mix_inner_burnin : mix_inner_prod
+        @printf("  -> Inner Mixing Ratio set to: %.2f\n", mix_inner)
+        # ---------------------------------
+        
         inner_C_errs = T[]
         inner_δC_steps = T[]
         last_inner_err = T(Inf) 
         
-        # --- NEW: Dynamic Inner Tolerance ---
-        # Starts loose (1e-3) and tightens by an order of magnitude each outer iteration until it hits inner_tol
-        current_inner_tol = max(inner_tol, T(1e-3) / T(10^(outer_iter - 1)))
+        current_inner_tol = max(inner_tol, T(1e-2) / T(10^(outer_iter - 1)))
         
         for inner_iter in 1:max_inner
             @printf("\n  --- Inner Iteration %d ---\n", inner_iter)
@@ -214,7 +218,6 @@ function solve_two_molecule_theory!(
             for idx in 1:grid.N
                 r = grid.r[idx]
                 w_r = T(0.5) * (T(1.0) - tanh((r - r_c) / α_w))
-                
                 for i in 1:N_sites, j in 1:N_sites
                     h_sim[i, j, idx] = w_r * h_sim[i, j, idx] + (T(1.0) - w_r) * h_PRISM_r[i, j, idx]
                 end
@@ -231,21 +234,28 @@ function solve_two_molecule_theory!(
             end
             
             δC = Δ_PRISM .- Δ_Two
-            err_step = sqrt(sum(δC.^2) / length(δC))
-            push!(inner_δC_steps, err_step)
             
-            # --- NEW: Relaxed MDIIS Flush (Tolerates a 20% noise spike) ---
+            err_integral = T(0.0)
+            for i in 1:N_sites, j in 1:N_sites
+                diff_sq = δC[i, j, :].^2
+                err_integral += trap_integrate(diff_sq, grid.Δk)
+            end
+            err_integral /= (N_sites * N_sites)
+            
+            push!(inner_δC_steps, err_integral)
+            err_rms = sqrt(sum(δC.^2) / length(δC))
+            
             noise_tolerance = T(1.20)
-            if use_mdiis_inner && err_step > (last_inner_err * noise_tolerance) && inner_iter > burn_in_inner + 1
+            if use_mdiis_inner && err_integral > (last_inner_err * noise_tolerance) && inner_iter > burn_in_inner + 1
                 println("    -> WARNING: Error spiked! Flushing Inner MDIIS history.")
                 reset!(inner_mdiis)
             end
-            last_inner_err = err_step
+            last_inner_err = err_integral
             
             max_step = T(1.0)
-            if err_step > max_step || isnan(err_step)
+            if err_rms > max_step || isnan(err_rms)
                 println("    -> WARNING: Large step detected! Clamping δC.")
-                δC .*= (max_step / err_step)
+                δC .*= (max_step / err_rms)
             end
             
             if (!use_mdiis_inner) || (inner_iter <= burn_in_inner)
@@ -265,12 +275,21 @@ function solve_two_molecule_theory!(
             C_err /= (N_sites * N_sites) 
             push!(inner_C_errs, C_err)
             
-            @printf("  Convergence ||δC|| Step: %.6e | ∫(ΔC_k)² dk: %.6e\n", err_step, C_err)
+            @printf("  Convergence ∫(δC)² dk: %.6e | Change in C_k: %.6e\n", err_integral, C_err)
             
-            # --- NEW: Dynamic Tolerance Break ---
-            if err_step < current_inner_tol
-                @printf("\n  *** INNER LOOP CONVERGED (Tol: %.1e)! ***\n", current_inner_tol)
+            # --- FIXED: Use True Physics Error (err_integral) for Convergence! ---
+            if err_integral < current_inner_tol
+                @printf("\n  *** INNER LOOP CONVERGED (True Residual < Tol: %.1e)! ***\n", current_inner_tol)
                 break
+            end
+            
+            # Plateau detector remains focused on how much the array physically moved
+            if inner_iter > 3
+                rel_change = abs(C_err - inner_C_errs[end-2]) / inner_C_errs[end-2]
+                if rel_change < 0.05 && C_err < 1e-3
+                    @printf("\n  *** NOISE FLOOR REACHED (Step error plateaued). Exiting early! ***\n")
+                    break
+                end
             end
         end
         
@@ -289,7 +308,15 @@ function solve_two_molecule_theory!(
         
         @printf("\n  Outer Solvation Error ∫(ΔW_r)² dr : %.6e\n", W_err)
         
-        # --- NEW: Outer Loop Convergence Check ---
+        # --- FIXED: Always save files before checking if the outer loop should break! ---
+        save_to_csv(joinpath(out_dir, "Wr", @sprintf("W_solv_outer_%02d.csv", outer_iter)), grid.r, W_solv)
+        save_to_csv(joinpath(out_dir, "Ck", @sprintf("C_k_outer_%02d.csv", outer_iter)), grid.k, C_k)
+        save_to_csv(joinpath(out_dir, "hr_fixed", @sprintf("h_r_fixed_outer_%02d.csv", outer_iter)), grid.r, h_fixed)
+        
+        jldsave(checkpoint_file; W_solv, C_k, outer_iter, W_err_list, C_err_history, dC_step_history=δC_step_history)
+        println("  -> Saved Checkpoint: $checkpoint_file")
+        # ---------------------------------------------------------------------------------
+        
         if W_err < outer_tol
             @printf("\n*** OUTER LOOP CONVERGED (Tol: %.1e)! ***\n", outer_tol)
             break
@@ -305,12 +332,6 @@ function solve_two_molecule_theory!(
             update_MDIIS!(W_solv, δW, outer_mdiis, mix_outer)
             println("  -> MDIIS Updated Outer Solvation Potential W(r)!")
         end
-        
-        save_to_csv(joinpath(out_dir, "Wr", @sprintf("W_solv_outer_%02d.csv", outer_iter)), grid.r, W_solv)
-        save_to_csv(joinpath(out_dir, "Ck", @sprintf("C_k_outer_%02d.csv", outer_iter)), grid.k, C_k)
-        save_to_csv(joinpath(out_dir, "hr_fixed", @sprintf("h_r_fixed_outer_%02d.csv", outer_iter)), grid.r, h_fixed)
-        
-        jldsave(checkpoint_file; W_solv, C_k, outer_iter, W_err_list, C_err_history, dC_step_history=δC_step_history)
     end
     
     return C_k, W_solv, h_fixed, configs, W_err_list, C_err_history, δC_step_history
