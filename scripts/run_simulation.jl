@@ -62,6 +62,11 @@ function save_run_log(filename::String, sys::SystemParameters, ch::ChainParamete
         if settings.use_attractive_lj
             println(io, rpad("  -> Ramp Iterations", 30), ": ", settings.lj_ramp_iters)
         end
+        println(io, "\n--- REWEIGHTING LOGIC ---")
+        println(io, rpad("Use Reweighting?", 30), ": ", settings.use_reweighting)
+        if settings.use_reweighting
+            println(io, rpad("Reliability Threshold (ζ)", 30), ": ", settings.reweight_zeta)
+        end
         
         println(io, "\n--- MONTE CARLO RESOLUTION ---")
         println(io, rpad("Chains Generated (Ω_k)", 30), ": ", settings.n_configs)
@@ -129,7 +134,10 @@ function main()
         
         use_attractive_lj = false,
         lj_ramp_iters     = 5,
-        
+
+        use_reweighting = true,
+        reweight_zeta   = 0.50,
+                
         inner_tol = 1e-5,
         outer_tol = 1e-4,
         

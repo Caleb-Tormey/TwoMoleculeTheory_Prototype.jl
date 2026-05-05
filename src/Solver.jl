@@ -2,14 +2,17 @@
 using JLD2
 
 function compute_omega!(
-    Ω_k::Array{T,3}, configs::Vector{Molecule{T}}, grid::RadialGrid{T}, 
-    sys_params::SystemParameters{T}, chain_params::ChainParameters{T} 
+    Ω_k::Array{T,3}, configs::Vector{Molecule{T}}, chain_weights::Vector{T}, # BACK: Weights array!
+    grid::RadialGrid{T}, sys_params::SystemParameters{T}, chain_params::ChainParameters{T} 
 ) where {T}
     N_sites = sys_params.N_sites
     N_monomers = sys_params.N_monomers
     Ω_r_accum = zeros(T, N_sites, N_sites, grid.N)
     
-    for mol in configs
+    Z_total = sum(chain_weights)
+    
+    for (c_idx, mol) in enumerate(configs)
+        w_j = chain_weights[c_idx]
         for i in 1:N_monomers, j in 1:N_monomers
             if i != j
                 dist = norm(mol[i] - mol[j])
@@ -17,7 +20,7 @@ function compute_omega!(
                 if 1 <= idx <= grid.N
                     s1 = chain_params.site_types[i]
                     s2 = chain_params.site_types[j]
-                    Ω_r_accum[s1, s2, idx] += 1.0
+                    Ω_r_accum[s1, s2, idx] += w_j
                 end
             end
         end
@@ -28,7 +31,7 @@ function compute_omega!(
     for idx in 1:grid.N
         shell_vol = T(3.0) * idx^2 + T(3.0) * idx + T(1.0)
         for i in 1:N_sites, j in 1:N_sites
-            Ω_r[i, j, idx] = (norm_factor * Ω_r_accum[i, j, idx]) / (length(configs) * shell_vol)
+            Ω_r[i, j, idx] = (norm_factor * Ω_r_accum[i, j, idx]) / (Z_total * shell_vol)
         end
     end
     
@@ -73,14 +76,15 @@ end
 
 function solve_two_molecule_theory!(
     sys_params::SystemParameters{T}, chain_params::ChainParameters{T}, grid::RadialGrid{T};
-    max_outer::Int = 10, max_inner::Int = 20, mix_outer::T = T(0.20),
-    mix_inner_burnin::T = T(0.15), mix_inner_prod::T = T(0.05), # NEW: Dynamic Mixing Parameters!
+    max_outer::Int = 10, max_inner::Int = 20, 
+    mix_inner_burnin::T = T(0.15), mix_inner_prod::T = T(0.05), mix_outer::T = T(0.20),
     use_mdiis_inner::Bool = true, burn_in_inner::Int = 3,
     use_mdiis_outer::Bool = false, burn_in_outer::Int = 100,
     sweep_mult_burnin::Int = 1, sweep_mult_prod::Int = 4, 
     sweep_transition_iter::Int = 5,
     n_configs::Int = 2500, save_step::Int = 400,           
     use_attractive_lj::Bool = false, lj_ramp_iters::Int = 5, 
+    use_reweighting::Bool = true, reweight_zeta::T = T(0.50), # BACK: Reweighting Settings!
     inner_tol::T = T(1e-5), outer_tol::T = T(1e-4), 
     initial_W::Union{Array{T,3}, Nothing} = nothing,
     out_dir::String = "output",
@@ -112,7 +116,6 @@ function solve_two_molecule_theory!(
     H_k        = zeros(T, N_sites, N_sites, grid.N)
     
     gen = PivotGenerator(n_configs, save_step) 
-    
     L_max = (sys_params.N_monomers - 1) * chain_params.l_bond
     z_max = 2.0 * L_max + chain_params.r_cut
     corrector = DivergenceCorrector(sys_params, chain_params, grid, z_max)
@@ -144,15 +147,16 @@ function solve_two_molecule_theory!(
         println("  -> Picking up at Outer Iteration $start_outer...")
     end
     
-    local configs
+    local configs::Vector{Molecule{T}}
+    chain_weights = ones(T, n_configs)
+    old_U_solv = zeros(T, n_configs)
     
     for outer_iter in start_outer:max_outer
         @printf("\n==================================================\n")
         @printf(">>> OUTER ITERATION %d <<<\n", outer_iter)
         @printf("==================================================\n")
         
-        σ_val = chain_params.σ[1]
-        ϵ_val = chain_params.ϵ[1]
+        σ_val, ϵ_val = chain_params.σ[1], chain_params.ϵ[1]
         r_min = T(1.1224620483) * σ_val 
         
         current_r_cut = r_min
@@ -175,19 +179,56 @@ function solve_two_molecule_theory!(
         W_solv_old .= W_solv 
         reset!(inner_mdiis)
         
-        println("Generating Single Chains in current Solvation Field...")
-        configs = generate_configs!(gen, chain_params, sys_params, W_solv, grid, current_r_cut, current_shift)
+        # --- BACK: REWEIGHTING LOGIC ---
+        generate_fresh_chains = true
         
-        compute_omega!(Ω_k, configs, grid, sys_params, chain_params) 
+        if use_reweighting && outer_iter > 1
+            β = 1.0 / (sys_params.k_B * sys_params.T_sys)
+            Z_total = T(0.0)
+            
+            for (c_idx, mol) in enumerate(configs)
+                new_U = calc_chain_solvation_energy(mol, chain_params, W_solv, grid)
+                old_U = old_U_solv[c_idx]
+                w_j = exp(-β * (new_U - old_U))
+                chain_weights[c_idx] = w_j
+                Z_total += w_j
+            end
+            
+            Z_tilde = Z_total / n_configs
+            reliability = min(Z_tilde, 1.0 / Z_tilde)
+            
+            @printf("  -> Reweighting Reliability (ζ): %.3f (Threshold: %.2f)\n", reliability, reweight_zeta)
+            
+            if reliability > reweight_zeta
+                println("  -> [!] SUCCESS: Reusing previous chains with thermodynamic reweighting!")
+                generate_fresh_chains = false
+                for (c_idx, mol) in enumerate(configs)
+                    old_U_solv[c_idx] = calc_chain_solvation_energy(mol, chain_params, W_solv, grid)
+                end
+            else
+                println("  -> [!] FAILURE: Weight degeneracy detected. Throwing away chains.")
+            end
+        end
+        
+        if generate_fresh_chains
+            println("Generating Fresh Single Chains in current Solvation Field...")
+            configs = generate_configs!(gen, chain_params, sys_params, W_solv, grid, current_r_cut, current_shift)
+            
+            fill!(chain_weights, T(1.0))
+            for (c_idx, mol) in enumerate(configs)
+                old_U_solv[c_idx] = calc_chain_solvation_energy(mol, chain_params, W_solv, grid)
+            end
+        end
+        # -------------------------------
+        
+        compute_omega!(Ω_k, configs, chain_weights, grid, sys_params, chain_params) 
         
         sweep_mult = outer_iter <= sweep_transition_iter ? sweep_mult_burnin : sweep_mult_prod
         MC_sweeps = sweep_mult * length(configs) 
         println("  -> Direct Sampling Sweeps set to: $(MC_sweeps) (Multiplier: $(sweep_mult)x)")
         
-        # --- NEW: Dynamic Mixing Logic ---
         mix_inner = outer_iter <= sweep_transition_iter ? mix_inner_burnin : mix_inner_prod
         @printf("  -> Inner Mixing Ratio set to: %.2f\n", mix_inner)
-        # ---------------------------------
         
         inner_C_errs = T[]
         inner_δC_steps = T[]
@@ -202,7 +243,7 @@ function solve_two_molecule_theory!(
             solve_prism_kspace!(Δ_PRISM, W_solv, C_k, Ω_k, grid, sys_params)
             
             h_sim .= 0.0
-            sample_direct!(h_sim, configs, MC_sweeps, start_n, stop_n, chain_params, sys_params, W_solv, grid, current_r_cut, current_shift)
+            sample_direct!(h_sim, configs, chain_weights, MC_sweeps, start_n, stop_n, chain_params, sys_params, W_solv, grid, current_r_cut, current_shift)
             
             H_PRISM_k = zeros(T, N_sites, N_sites, grid.N)
             for i in 1:grid.N
@@ -241,10 +282,9 @@ function solve_two_molecule_theory!(
                 err_integral += trap_integrate(diff_sq, grid.Δk)
             end
             err_integral /= (N_sites * N_sites)
-            
             push!(inner_δC_steps, err_integral)
-            err_rms = sqrt(sum(δC.^2) / length(δC))
             
+            err_rms = sqrt(sum(δC.^2) / length(δC))
             noise_tolerance = T(1.20)
             if use_mdiis_inner && err_integral > (last_inner_err * noise_tolerance) && inner_iter > burn_in_inner + 1
                 println("    -> WARNING: Error spiked! Flushing Inner MDIIS history.")
@@ -254,17 +294,13 @@ function solve_two_molecule_theory!(
             
             max_step = T(1.0)
             if err_rms > max_step || isnan(err_rms)
-                println("    -> WARNING: Large step detected! Clamping δC.")
                 δC .*= (max_step / err_rms)
             end
             
             if (!use_mdiis_inner) || (inner_iter <= burn_in_inner)
                 C_k .+= mix_inner .* δC
-                status_str = use_mdiis_inner ? " (Burn-in)" : ""
-                println("    -> Picard Mixed C(k)$status_str")
             else
                 update_MDIIS!(C_k, δC, inner_mdiis, mix_inner)
-                println("    -> MDIIS Updated C(k)")
             end
             
             C_err = T(0.0)
@@ -277,27 +313,26 @@ function solve_two_molecule_theory!(
             
             @printf("  Convergence ∫(δC)² dk: %.6e | Change in C_k: %.6e\n", err_integral, C_err)
             
-            # --- FIXED: Use True Physics Error (err_integral) for Convergence! ---
-            if err_integral < current_inner_tol
-                @printf("\n  *** INNER LOOP CONVERGED (True Residual < Tol: %.1e)! ***\n", current_inner_tol)
+            # --- BACK: The Noise Floor Plateau Detectors ---
+            if C_err < current_inner_tol
+                @printf("\n  *** INNER LOOP CONVERGED (Change in C_k < Tol: %.1e)! ***\n", current_inner_tol)
                 break
             end
             
-            # Plateau detector remains focused on how much the array physically moved
             if inner_iter > 3
                 rel_change = abs(C_err - inner_C_errs[end-2]) / inner_C_errs[end-2]
                 if rel_change < 0.05 && C_err < 1e-3
-                    @printf("\n  *** NOISE FLOOR REACHED (Step error plateaued). Exiting early! ***\n")
+                    @printf("\n  *** NOISE FLOOR REACHED (Error plateaued at %.1e). Exiting early! ***\n", C_err)
                     break
                 end
             end
+            # -----------------------------------------------
         end
         
         push!(C_err_history, inner_C_errs)
         push!(δC_step_history, inner_δC_steps)
         
         δW = W_solv .- W_solv_old
-        
         W_err = T(0.0)
         for i in 1:N_sites, j in 1:N_sites
             diff_sq = (δW[i, j, :]).^2
@@ -308,15 +343,6 @@ function solve_two_molecule_theory!(
         
         @printf("\n  Outer Solvation Error ∫(ΔW_r)² dr : %.6e\n", W_err)
         
-        # --- FIXED: Always save files before checking if the outer loop should break! ---
-        save_to_csv(joinpath(out_dir, "Wr", @sprintf("W_solv_outer_%02d.csv", outer_iter)), grid.r, W_solv)
-        save_to_csv(joinpath(out_dir, "Ck", @sprintf("C_k_outer_%02d.csv", outer_iter)), grid.k, C_k)
-        save_to_csv(joinpath(out_dir, "hr_fixed", @sprintf("h_r_fixed_outer_%02d.csv", outer_iter)), grid.r, h_fixed)
-        
-        jldsave(checkpoint_file; W_solv, C_k, outer_iter, W_err_list, C_err_history, dC_step_history=δC_step_history)
-        println("  -> Saved Checkpoint: $checkpoint_file")
-        # ---------------------------------------------------------------------------------
-        
         if W_err < outer_tol
             @printf("\n*** OUTER LOOP CONVERGED (Tol: %.1e)! ***\n", outer_tol)
             break
@@ -324,14 +350,17 @@ function solve_two_molecule_theory!(
         
         if (!use_mdiis_outer) || (outer_iter <= burn_in_outer)
             W_solv .= W_solv_old .+ mix_outer .* δW
-            status_str = use_mdiis_outer ? " (Burn-in)" : ""
-            println("  -> Picard Mixed Outer Solvation Potential W(r)$status_str")
             reset!(outer_mdiis)
         else
             W_solv .= W_solv_old
             update_MDIIS!(W_solv, δW, outer_mdiis, mix_outer)
-            println("  -> MDIIS Updated Outer Solvation Potential W(r)!")
         end
+        
+        save_to_csv(joinpath(out_dir, "Wr", @sprintf("W_solv_outer_%02d.csv", outer_iter)), grid.r, W_solv)
+        save_to_csv(joinpath(out_dir, "Ck", @sprintf("C_k_outer_%02d.csv", outer_iter)), grid.k, C_k)
+        save_to_csv(joinpath(out_dir, "hr_fixed", @sprintf("h_r_fixed_outer_%02d.csv", outer_iter)), grid.r, h_fixed)
+        
+        jldsave(checkpoint_file; W_solv, C_k, outer_iter, W_err_list, C_err_history, dC_step_history=δC_step_history)
     end
     
     return C_k, W_solv, h_fixed, configs, W_err_list, C_err_history, δC_step_history

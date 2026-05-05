@@ -13,7 +13,7 @@ end
 function calc_internal_energy(
     molecule::Molecule{T}, chain_params::ChainParameters{T}, sys_params::SystemParameters{T},
     W_solv::Array{T,3}, grid::RadialGrid{T}, 
-    current_r_cut::T, current_shift::T # NEW: Dynamic cutoff and shift
+    current_r_cut::T, current_shift::T 
 ) where {T}
     E_total = T(0.0)
     N = length(molecule)
@@ -51,7 +51,6 @@ function calc_internal_energy(
             dz = molecule[i][3] - molecule[j][3]
             dist = sqrt(dx^2 + dy^2 + dz^2)
             
-            # --- NEW: Using the dynamically grown r_cut ---
             if dist < current_r_cut
                 σ_ij, ϵ_ij = chain_params.σ[1], chain_params.ϵ[1] 
                 term = (σ_ij / dist)^6
@@ -76,6 +75,41 @@ function calc_internal_energy(
     return E_total
 end
 
+# --- NEW: Function to rapidly calculate just the Solvation Energy of a chain ---
+function calc_chain_solvation_energy(
+    molecule::Molecule{T}, chain_params::ChainParameters{T}, 
+    W_solv::Array{T,3}, grid::RadialGrid{T}
+) where {T}
+    E_solv = T(0.0)
+    N = length(molecule)
+    exclude = 4 
+    r_max = grid.N * grid.Δr
+    
+    @inbounds for i in 1:(N - exclude)
+        for j in (i + exclude):N
+            dx = molecule[i][1] - molecule[j][1]
+            dy = molecule[i][2] - molecule[j][2]
+            dz = molecule[i][3] - molecule[j][3]
+            dist = sqrt(dx^2 + dy^2 + dz^2)
+            
+            if dist < r_max
+                dist_idx = dist / grid.Δr
+                idx_low = max(1, floor(Int, dist_idx))
+                idx_high = min(grid.N, idx_low + 1)
+                fraction = dist_idx - floor(dist_idx)
+                
+                s1 = chain_params.site_types[i]
+                s2 = chain_params.site_types[j]
+                
+                w_low, w_high = W_solv[s1, s2, idx_low], W_solv[s1, s2, idx_high]
+                E_solv += w_low * (T(1.0) - fraction) + w_high * fraction
+            end
+        end
+    end
+    return E_solv
+end
+# -----------------------------------------------------------------------------
+
 @inline function rodrigues_rotate(v::SVector{3, T}, k::SVector{3, T}, cos_θ::T, sin_θ::T) where {T}
     return v * cos_θ + cross(k, v) * sin_θ + k * dot(k, v) * (1 - cos_θ)
 end
@@ -95,13 +129,12 @@ function MC_step!(
     molecule::Molecule{T}, temp_molecule::Molecule{T}, current_energy::T, rng::AbstractRNG,
     chain_params::ChainParameters{T}, sys_params::SystemParameters{T}, W_solv::Array{T,3}, grid::RadialGrid{T},
     angle_range::T, dihedral_range::T, 
-    current_r_cut::T, current_shift::T # NEW: Dynamic cutoff
+    current_r_cut::T, current_shift::T 
 ) where {T}
     accept_bend, accept_twist = 0, 0
     N = length(molecule)
     β = 1.0 / (sys_params.k_B * sys_params.T_sys)
     
-    # BEND
     bend_idx = rand(rng, 2:(N-1))
     Δθ = (rand(rng, T) - T(0.5)) * 2 * angle_range
     v1 = SVector{3, T}(temp_molecule[bend_idx-1][1:3]) - SVector{3, T}(temp_molecule[bend_idx][1:3])
@@ -121,7 +154,6 @@ function MC_step!(
         temp_molecule .= molecule
     end
     
-    # TWIST
     twist_idx = rand(rng, 2:(N-2))
     Δϕ = (rand(rng, T) - T(0.5)) * 2 * dihedral_range
     axis_twist = normalize(SVector{3, T}(temp_molecule[twist_idx+1][1:3]) - SVector{3, T}(temp_molecule[twist_idx][1:3]))
@@ -145,7 +177,7 @@ end
 function generate_configs!(
     generator::PivotGenerator, chain_params::ChainParameters{T}, sys_params::SystemParameters{T}, 
     W_solv::Array{T,3}, grid::RadialGrid{T}, 
-    current_r_cut::T, current_shift::T # NEW: Dynamic cutoff
+    current_r_cut::T, current_shift::T 
 ) where {T}
     N = sys_params.N_monomers
     rng = TaskLocalRNG()
@@ -223,7 +255,7 @@ function evaluate_two_chain!(
     ws::ThreadWorkspace{T}, mol1::Molecule{T}, mol2::Molecule{T},
     s1_idx::Int, s2_idx::Int, z_shift::T, rng::AbstractRNG,
     chain_params::ChainParameters{T}, W_solv::Array{T,3}, grid::RadialGrid{T}, 
-    current_r_cut::T, current_shift::T # NEW: Dynamic cutoff
+    current_r_cut::T, current_shift::T 
 ) where {T}
     N = length(mol1)
     s1_pos = SVector{3, T}(mol1[s1_idx][1:3])
@@ -251,14 +283,12 @@ function evaluate_two_chain!(
         idx = clamp(round(Int, dist_idx_float), 1, grid.N)
         ws.dist_indices[i, j] = idx
         
-        # --- NEW: Evaluate LJ purely against the dynamic cutoff ---
         if dist < current_r_cut
             σ_ij, ϵ_ij = chain_params.σ[1], chain_params.ϵ[1] 
             term = (σ_ij / dist)^6
             lj_val = T(4.0) * ϵ_ij * (term^2 - term + T(0.25))
             E_inter += lj_val - current_shift
         end
-        # ----------------------------------------------------------
         
         if dist < r_max
             idx_low = max(1, floor(Int, dist_idx_float))
@@ -275,15 +305,24 @@ function evaluate_two_chain!(
     return E_inter
 end
 
+# --- NEW: Helper function for fast weighted random sampling via Cumulative Sum ---
+function sample_weighted(cumsum_weights::Vector{T}, rng::AbstractRNG) where {T}
+    target = rand(rng, T) * cumsum_weights[end]
+    return searchsortedfirst(cumsum_weights, target)
+end
+
 function sample_direct!(
-    h_sim::Array{T,3}, configs::Vector{Molecule{T}}, MC_steps::Int, 
-    start_n::Int, stop_n::Int, chain_params::ChainParameters{T}, 
+    h_sim::Array{T,3}, configs::Vector{Molecule{T}}, chain_weights::Vector{T}, # NEW: Weights array
+    MC_steps::Int, start_n::Int, stop_n::Int, chain_params::ChainParameters{T}, 
     sys_params::SystemParameters{T}, W_solv::Array{T,3}, grid::RadialGrid{T}, 
-    current_r_cut::T, current_shift::T
+    current_r_cut::T, current_shift::T 
 ) where {T}
     N_configs = length(configs)
     N_monomers = sys_params.N_monomers
     β = 1.0 / (sys_params.k_B * sys_params.T_sys)
+    
+    # Pre-calculate the Cumulative Sum array for lightning-fast weighted chain selection!
+    cumsum_weights = cumsum(chain_weights)
     
     n_workspaces = max(Threads.nthreads(), Threads.maxthreadid())
     workspaces =[ThreadWorkspace(N_monomers, sys_params.N_sites, grid.N, T) for _ in 1:n_workspaces]
@@ -297,8 +336,13 @@ function sample_direct!(
         
         for n in start_n:stop_n
             z_shift = n * grid.Δr
-            mol1 = configs[rand(rng, 1:N_configs)]
-            mol2 = configs[rand(rng, 1:N_configs)]
+            
+            # --- NEW: Pick chains using their thermodynamic re-weights! ---
+            idx1 = sample_weighted(cumsum_weights, rng)
+            idx2 = sample_weighted(cumsum_weights, rng)
+            mol1 = configs[idx1]
+            mol2 = configs[idx2]
+            
             s1_idx = rand(rng, 1:N_monomers)
             s2_idx = rand(rng, 1:N_monomers)
             
@@ -337,7 +381,6 @@ function sample_direct!(
         end
     end
     
-    # --- NEW: Explicit Symmetrization of Off-Diagonals ---
     for i in 1:(sys_params.N_sites - 1)
         for j in (i + 1):sys_params.N_sites
             for k in 1:grid.N
@@ -347,7 +390,6 @@ function sample_direct!(
             end
         end
     end
-    # -----------------------------------------------------
 end
 
 function export_xyz(filename::String, configs::Vector{Molecule{T}}) where {T}
