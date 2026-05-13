@@ -506,17 +506,14 @@ function run_window(
     mol1 = copy(mol_pool[rand(rng, 1:length(mol_pool))])
     mol2 = copy(mol_pool[rand(rng, 1:length(mol_pool))])
     
-    # Initialize Mol2 at exactly r_mid to guarantee starting in-bounds
     mid = length(mol1) ÷ 2
     p1 = SVector{3,T}(mol1[mid][1:3])
     p2 = SVector{3,T}(mol2[mid][1:3])
     
-    # ---- FIXED BLOCK ----
     diff_vec = p2 - p1
     n_diff = norm(diff_vec)
     dir = n_diff == 0 ? SVector{3,T}(1.0, 0.0, 0.0) : diff_vec / n_diff
     translate_chain!(mol2, (p1 + dir * r_mid) - p2)
-    # ---------------------
     
     temp_mol1 = copy(mol1)
     temp_mol2 = copy(mol2)
@@ -530,7 +527,9 @@ function run_window(
     trans_range = T(0.5)
 
     M_total = 0
-# ... (rest of the function remains identical)
+    count_L = 0.0
+    count_R = 0.0
+
     for step in 1:n_steps
         curr_E_tot, acc = MC_step_window!(
             mol1, mol2, temp_mol1, temp_mol2, curr_E_tot, rng,
@@ -541,6 +540,13 @@ function run_window(
         if step > 10_000 && step % 50 == 0
             M_total += 1
             r_mid_curr = norm(SVector{3,T}(mol1[mid][1:3]) - SVector{3,T}(mol2[mid][1:3]))
+            
+            # Robust Partition Function Trackers
+            if r_mid_curr <= r_mid
+                count_L += 1.0
+            else
+                count_R += 1.0
+            end
             
             for i in 1:length(mol1), j in 1:length(mol2)
                 dist = norm(SVector{3,T}(mol1[i][1:3]) - SVector{3,T}(mol2[j][1:3]))
@@ -558,7 +564,6 @@ function run_window(
         end
     end
     
-    # Volume normalization
     for idx in 1:n_bins
         r = (idx - 0.5) * dr
         if r > 0
@@ -570,7 +575,11 @@ function run_window(
         end
     end
     
-    return hist_L, hist_R
+    # Return as fractions of total accepted states
+    frac_L = M_total > 0 ? count_L / M_total : T(0.5)
+    frac_R = M_total > 0 ? count_R / M_total : T(0.5)
+    
+    return hist_L, hist_R, frac_L, frac_R
 end
 
 # --- Orchestrator & Multi-Site Stitching ---
@@ -585,6 +594,8 @@ function sample_window!(
     
     L_hists = Vector{Array{T,3}}(undef, num_windows)
     R_hists = Vector{Array{T,3}}(undef, num_windows)
+    L_counts = zeros(T, num_windows)
+    R_counts = zeros(T, num_windows)
     
     println("   -> Simulating $num_windows windows in parallel...")
     Threads.@threads for i in 1:num_windows
@@ -593,7 +604,14 @@ function sample_window!(
         r_max = r_min + sampler.win_width
         r_mid = r_min + sampler.overlap
         
-        L_hists[i], R_hists[i] = run_window(configs, sys_params, chain_params, W_solv, grid, r_min, r_mid, r_max, dr, sampler.n_steps, rng)
+        L_hists[i], R_hists[i], L_counts[i], R_counts[i] = run_window(configs, sys_params, chain_params, W_solv, grid, r_min, r_mid, r_max, dr, sampler.n_steps, rng)
+    end
+    
+    # 1. Calculate pure thermodynamic scaling factors (alpha)
+    alphas = zeros(T, num_windows)
+    alphas[1] = 1.0
+    for i in 2:num_windows
+        alphas[i] = (R_counts[i-1] * alphas[i-1]) / max(L_counts[i], T(1e-8))
     end
     
     println("   -> Stitching overlapping matrices...")
@@ -603,60 +621,40 @@ function sample_window!(
     for s1 in 1:N_sites, s2 in 1:N_sites
         master_pair = zeros(T, grid.N)
         master_pair .+= L_hists[1][s1, s2, :]
-        current_R = R_hists[1][s1, s2, :]
+        current_R = R_hists[1][s1, s2, :] .* alphas[1]
         
+        # 2. Simple Arithmetic Mean for exact thermodynamic overlaps
         for i in 2:num_windows
-            L_i = L_hists[i][s1, s2, :]
-            R_i = R_hists[i][s1, s2, :]
+            L_i_scaled = L_hists[i][s1, s2, :] .* alphas[i]
+            R_i_scaled = R_hists[i][s1, s2, :] .* alphas[i]
             
-            num = zero(T)
-            den = zero(T)
-            for j in 1:grid.N
-                num += current_R[j] * L_i[j]
-                den += L_i[j] * L_i[j]
-            end
-            alpha = den > 0 ? num / den : T(1.0)
-            
-            L_i_scaled = L_i .* alpha
-            R_i_scaled = R_i .* alpha
-            
-            C_i = zeros(T, grid.N)
-            for j in 1:grid.N
-                v1 = current_R[j]
-                v2 = L_i_scaled[j]
-                if v1 == 0 && v2 > 0
-                    C_i[j] = v2
-                elseif v2 == 0 && v1 > 0
-                    C_i[j] = v1
-                elseif v1 > 0 && v2 > 0
-                    denom = v1 + (alpha^2) * L_i[j]
-                    beta = ((alpha^2) * L_i[j]) / denom
-                    C_i[j] = beta * v1 + (1 - beta) * v2
-                end
-            end
+            C_i = (current_R .+ L_i_scaled) .* T(0.5)
             master_pair .+= C_i
-            current_R .= R_i_scaled
+            current_R = R_i_scaled
         end
         master_pair .+= current_R
         master_hist[s1, s2, :] .= master_pair
     end
     
-    # Phase 1 Normalization: Scale flat tail rigidly to 1.0
-    idx_norm_start = floor(Int, (sampler.sim_r_cut - 2.0) / dr)
-    idx_norm_end   = floor(Int, sampler.sim_r_cut / dr)
+    # 3. Dynamic Truncation & Normalization
+    max_chain_ext = sys_params.N_monomers * chain_params.l_bond
+    valid_r_max = sampler.sim_r_cut - max_chain_ext
+    
+    idx_norm_end = min(grid.N, max(1, floor(Int, valid_r_max / dr)))
+    idx_norm_start = max(1, floor(Int, (valid_r_max - 15.0) / dr))
     
     for s1 in 1:N_sites, s2 in 1:N_sites
+        # Sample the flat physics EXACTLY before the drop-off begins
         tail_mean = mean(master_hist[s1, s2, idx_norm_start:idx_norm_end])
         if tail_mean > 0
             master_hist[s1, s2, :] ./= tail_mean
         end
         
-        # Construct h(r) = g(r) - 1
         for k in 1:grid.N
             if k <= idx_norm_end
                 h_sim[s1, s2, k] = master_hist[s1, s2, k] - 1.0
             else
-                h_sim[s1, s2, k] = 0.0 # Force tail to 0.0 structurally
+                h_sim[s1, s2, k] = 0.0 # Force tail flat where physics are truncated
             end
         end
     end

@@ -1,0 +1,3 @@
+Outer_Iter,Inner_Iter,deltaC_Step,C_k_Error,W_r_Error
+1,1,3.510920e+00,7.742448e-02,NaN
+1,2,8.810984e+00,7.836803e-02,5.498816e-10

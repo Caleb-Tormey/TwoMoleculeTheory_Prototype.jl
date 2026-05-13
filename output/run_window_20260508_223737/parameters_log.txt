@@ -1,0 +1,35 @@
+==================================================
+   TWO-MOLECULE THEORY: SIMULATION RUN LOG
+==================================================
+Timestamp: 2026-05-08 22:37:37
+
+--- SYSTEM & GRID PARAMETERS ---
+Temperature (K)               : 405.0
+Density (ρ)                   : 0.03123
+Grid Points (N)               : 2048
+Grid Spacing Δr (Å)           : 0.1
+
+--- SOLVER SETTINGS ---
+max_outer                     : 5
+max_inner                     : 15
+mix_inner_burnin              : 0.15
+mix_inner_prod                : 0.05
+mix_outer                     : 0.2
+use_mdiis_inner               : true
+burn_in_inner                 : 3
+use_mdiis_outer               : false
+burn_in_outer                 : 100
+use_window_sampling           : true
+window_sampler                : WindowSampler(15, 3.0, 3.0, 100000, 5000, 400, 12)
+n_configs                     : 5000
+save_step                     : 400
+sweep_mult_burnin             : 1
+sweep_mult_prod               : 4
+sweep_transition_iter         : 5
+use_attractive_lj             : false
+lj_ramp_iters                 : 5
+use_reweighting               : false
+reweight_zeta                 : 0.5
+inner_tol                     : 1.0e-5
+outer_tol                     : 0.0001
+resume                        : false

@@ -30,16 +30,16 @@ function main()
     println("\n[1] Running Direct Sampling...")
     h_direct = zeros(Float64, sys.N_sites, sys.N_sites, grid.N)
     # Equivalent to 2.5 million MC total configs
-    sample_direct!(h_direct, configs, 10_000, 33, 250, ch_params, sys, W_solv, grid) 
+    sample_direct!(h_direct, configs, 10_000, 33, 700, ch_params, sys, W_solv, grid) 
 
     println("\n[2] Running Window Sampling...")
     # win_width = 3.0, overlap = 1.5, n_steps = 300,000, sim_r_cut = 25.0
-    win_sampler = WindowSampler(3.0, 1.5, 300_000, 25.0)
+    win_sampler = WindowSampler(3.0, 1.5, 300_000, 70.0)
     h_window = zeros(Float64, sys.N_sites, sys.N_sites, grid.N)
     sample_window!(h_window, configs, win_sampler, ch_params, sys, W_solv, grid)
 
     # Exporting
-    idx_max = 250 # 25.0 Angstroms
+    idx_max = 2048 # 25.0 Angstroms
     r_vals = grid.r[1:idx_max]
     
     # Reconstructing g(r) = h(r) + 1.0 (Note: Direct sample output is technically manipulated by 144 pairs, so we undo that conceptually if it's strictly h(r))
