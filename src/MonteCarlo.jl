@@ -344,3 +344,320 @@ function export_xyz(filename::String, configs::Vector{Molecule{T}}) where {T}
     end
     println("Saved $(length(configs)) configurations to $filename")
 end
+
+# ---------------------------------------------------------
+# Window Sampling Transformations and Energy Evaluations
+# ---------------------------------------------------------
+# --- Rigid Body Transformations ---
+function translate_chain!(molecule::Molecule{T}, shift::SVector{3, T}) where {T}
+    @inbounds for i in 1:length(molecule)
+        molecule[i] = SVector{4, T}(molecule[i][1] + shift[1], molecule[i][2] + shift[2], molecule[i][3] + shift[3], 1.0)
+    end
+end
+
+function rotate_chain!(molecule::Molecule{T}, pivot_idx::Int, rot_mat::SMatrix{3, 3, T}) where {T}
+    pivot_pos = SVector{3, T}(molecule[pivot_idx][1:3])
+    @inbounds for i in 1:length(molecule)
+        p = SVector{3, T}(molecule[i][1:3]) - pivot_pos
+        p_rot = rot_mat * p
+        molecule[i] = SVector{4, T}(pivot_pos[1] + p_rot[1], pivot_pos[2] + p_rot[2], pivot_pos[3] + p_rot[3], 1.0)
+    end
+end
+
+# --- Isolated Intermolecular Energy ---
+function calc_intermolecular_energy(
+    mol1::Molecule{T}, mol2::Molecule{T},
+    chain_params::ChainParameters{T}, W_solv::Array{T,3}, grid::RadialGrid{T}
+) where {T}
+    E_inter = T(0.0)
+    N = length(mol1)
+    r_max = grid.N * grid.Δr
+    @inbounds for i in 1:N, j in 1:N
+        dx = mol1[i][1] - mol2[j][1]
+        dy = mol1[i][2] - mol2[j][2]
+        dz = mol1[i][3] - mol2[j][3]
+        dist = sqrt(dx^2 + dy^2 + dz^2)
+        
+        if dist < chain_params.r_cut
+            σ_ij, ϵ_ij = chain_params.σ[1], chain_params.ϵ[1] 
+            term = (σ_ij / dist)^6
+            E_inter += T(4.0) * ϵ_ij * (term^2 - term + T(0.25)) - chain_params.LJ_shift
+        end
+        if dist < r_max
+            dist_idx_float = dist / grid.Δr
+            idx_low = max(1, floor(Int, dist_idx_float))
+            idx_high = min(grid.N, idx_low + 1)
+            fraction = dist_idx_float - floor(dist_idx_float)
+            
+            s1 = chain_params.site_types[i]
+            s2 = chain_params.site_types[j]
+            
+            w_low = W_solv[s1, s2, idx_low]
+            w_high = W_solv[s1, s2, idx_high]
+            E_inter += w_low * (T(1.0) - fraction) + w_high * fraction
+        end
+    end
+    return E_inter
+end
+
+# --- Window Sampling MC Step ---
+function MC_step_window!(
+    mol1::Molecule{T}, mol2::Molecule{T}, 
+    temp_mol1::Molecule{T}, temp_mol2::Molecule{T},
+    curr_E_tot::T, rng::AbstractRNG,
+    chain_params::ChainParameters{T}, sys_params::SystemParameters{T},
+    W_solv::Array{T,3}, grid::RadialGrid{T},
+    r_min::T, r_max::T,
+    angle_range::T, dihedral_range::T, trans_range::T
+) where {T}
+    N = length(mol1)
+    β = 1.0 / (sys_params.k_B * sys_params.T_sys)
+    
+    temp_mol1 .= mol1
+    temp_mol2 .= mol2
+    
+    # 1. Pivot on Mol 1
+    if rand(rng, 1:2) == 1
+        bend_idx = rand(rng, 2:(N-1))
+        Δθ = (rand(rng, T) - T(0.5)) * 2 * angle_range
+        v1 = SVector{3, T}(temp_mol1[bend_idx-1][1:3]) - SVector{3, T}(temp_mol1[bend_idx][1:3])
+        v2 = SVector{3, T}(temp_mol1[bend_idx+1][1:3]) - SVector{3, T}(temp_mol1[bend_idx][1:3])
+        axis_bend = normalize(cross(v1, v2))
+        if (bend_idx - 1) <= (N - bend_idx)
+            rotate_arm!(temp_mol1, bend_idx, axis_bend, Δθ, 1, bend_idx - 1)
+        else
+            rotate_arm!(temp_mol1, bend_idx, axis_bend, Δθ, bend_idx + 1, N)
+        end
+    else
+        twist_idx = rand(rng, 2:(N-2))
+        Δϕ = (rand(rng, T) - T(0.5)) * 2 * dihedral_range
+        axis_twist = normalize(SVector{3, T}(temp_mol1[twist_idx+1][1:3]) - SVector{3, T}(temp_mol1[twist_idx][1:3]))
+        if (twist_idx - 1) <= (N - twist_idx)
+            rotate_arm!(temp_mol1, twist_idx, axis_twist, Δϕ, 1, twist_idx - 1)
+        else
+            rotate_arm!(temp_mol1, twist_idx, axis_twist, Δϕ, twist_idx + 1, N)
+        end
+    end
+
+    # 2. Pivot on Mol 2
+    if rand(rng, 1:2) == 1
+        bend_idx = rand(rng, 2:(N-1))
+        Δθ = (rand(rng, T) - T(0.5)) * 2 * angle_range
+        v1 = SVector{3, T}(temp_mol2[bend_idx-1][1:3]) - SVector{3, T}(temp_mol2[bend_idx][1:3])
+        v2 = SVector{3, T}(temp_mol2[bend_idx+1][1:3]) - SVector{3, T}(temp_mol2[bend_idx][1:3])
+        axis_bend = normalize(cross(v1, v2))
+        if (bend_idx - 1) <= (N - bend_idx)
+            rotate_arm!(temp_mol2, bend_idx, axis_bend, Δθ, 1, bend_idx - 1)
+        else
+            rotate_arm!(temp_mol2, bend_idx, axis_bend, Δθ, bend_idx + 1, N)
+        end
+    else
+        twist_idx = rand(rng, 2:(N-2))
+        Δϕ = (rand(rng, T) - T(0.5)) * 2 * dihedral_range
+        axis_twist = normalize(SVector{3, T}(temp_mol2[twist_idx+1][1:3]) - SVector{3, T}(temp_mol2[twist_idx][1:3]))
+        if (twist_idx - 1) <= (N - twist_idx)
+            rotate_arm!(temp_mol2, twist_idx, axis_twist, Δϕ, 1, twist_idx - 1)
+        else
+            rotate_arm!(temp_mol2, twist_idx, axis_twist, Δϕ, twist_idx + 1, N)
+        end
+    end
+
+    # 3. Rigid Translation & Rotation of Mol 2
+    shift = (rand(rng, SVector{3, T}) .- T(0.5)) .* trans_range
+    translate_chain!(temp_mol2, shift)
+    rot_mat = random_rotation_matrix(rng, T)
+    rotate_chain!(temp_mol2, rand(rng, 1:N), rot_mat)
+
+    # 4. Strict Window Bounding Check (using Middle Sites)
+    mid = N ÷ 2
+    r_mid_dist = norm(SVector{3, T}(temp_mol1[mid][1:3]) - SVector{3, T}(temp_mol2[mid][1:3]))
+    if r_mid_dist < r_min || r_mid_dist > r_max
+        return curr_E_tot, 0
+    end
+
+    # 5. Energy Eval & Metropolis
+    E_intra1 = calc_internal_energy(temp_mol1, chain_params, sys_params, W_solv, grid)
+    E_intra2 = calc_internal_energy(temp_mol2, chain_params, sys_params, W_solv, grid)
+    E_inter  = calc_intermolecular_energy(temp_mol1, temp_mol2, chain_params, W_solv, grid)
+    new_E_tot = E_intra1 + E_intra2 + E_inter
+
+    ΔE = new_E_tot - curr_E_tot
+    if ΔE <= 0.0 || rand(rng, T) <= exp(-ΔE * β)
+        mol1 .= temp_mol1
+        mol2 .= temp_mol2
+        return new_E_tot, 1
+    else
+        return curr_E_tot, 0
+    end
+end
+
+# --- Core Window Runner ---
+function run_window(
+    mol_pool::Vector{Molecule{T}},
+    sys_params::SystemParameters{T}, chain_params::ChainParameters{T}, W_solv::Array{T,3}, grid::RadialGrid{T},
+    r_min::T, r_mid::T, r_max::T, dr::T, n_steps::Int, rng::AbstractRNG
+) where {T}
+    N_sites = sys_params.N_sites
+    n_bins = grid.N
+    
+    hist_L = zeros(T, N_sites, N_sites, n_bins)
+    hist_R = zeros(T, N_sites, N_sites, n_bins)
+    
+    mol1 = copy(mol_pool[rand(rng, 1:length(mol_pool))])
+    mol2 = copy(mol_pool[rand(rng, 1:length(mol_pool))])
+    
+    # Initialize Mol2 at exactly r_mid to guarantee starting in-bounds
+    mid = length(mol1) ÷ 2
+    p1 = SVector{3,T}(mol1[mid][1:3])
+    p2 = SVector{3,T}(mol2[mid][1:3])
+    
+    # ---- FIXED BLOCK ----
+    diff_vec = p2 - p1
+    n_diff = norm(diff_vec)
+    dir = n_diff == 0 ? SVector{3,T}(1.0, 0.0, 0.0) : diff_vec / n_diff
+    translate_chain!(mol2, (p1 + dir * r_mid) - p2)
+    # ---------------------
+    
+    temp_mol1 = copy(mol1)
+    temp_mol2 = copy(mol2)
+    
+    curr_E_tot = calc_internal_energy(mol1, chain_params, sys_params, W_solv, grid) + 
+                 calc_internal_energy(mol2, chain_params, sys_params, W_solv, grid) + 
+                 calc_intermolecular_energy(mol1, mol2, chain_params, W_solv, grid)
+    
+    angle_range = T(20.0 * π / 180.0)
+    dihedral_range = T(π / 2.0)
+    trans_range = T(0.5)
+
+    M_total = 0
+# ... (rest of the function remains identical)
+    for step in 1:n_steps
+        curr_E_tot, acc = MC_step_window!(
+            mol1, mol2, temp_mol1, temp_mol2, curr_E_tot, rng,
+            chain_params, sys_params, W_solv, grid,
+            r_min, r_max, angle_range, dihedral_range, trans_range
+        )
+        
+        if step > 10_000 && step % 50 == 0
+            M_total += 1
+            r_mid_curr = norm(SVector{3,T}(mol1[mid][1:3]) - SVector{3,T}(mol2[mid][1:3]))
+            
+            for i in 1:length(mol1), j in 1:length(mol2)
+                dist = norm(SVector{3,T}(mol1[i][1:3]) - SVector{3,T}(mol2[j][1:3]))
+                dist_idx = ceil(Int, dist / dr)
+                if 1 <= dist_idx <= n_bins
+                    s1 = chain_params.site_types[i]
+                    s2 = chain_params.site_types[j]
+                    if r_mid_curr <= r_mid
+                        hist_L[s1, s2, dist_idx] += 1.0
+                    else
+                        hist_R[s1, s2, dist_idx] += 1.0
+                    end
+                end
+            end
+        end
+    end
+    
+    # Volume normalization
+    for idx in 1:n_bins
+        r = (idx - 0.5) * dr
+        if r > 0
+            vol = 4 * T(π) * (r^2) * dr * M_total
+            for s1 in 1:N_sites, s2 in 1:N_sites
+                hist_L[s1, s2, idx] /= vol
+                hist_R[s1, s2, idx] /= vol
+            end
+        end
+    end
+    
+    return hist_L, hist_R
+end
+
+# --- Orchestrator & Multi-Site Stitching ---
+function sample_window!(
+    h_sim::Array{T,3}, configs::Vector{Molecule{T}}, sampler::WindowSampler{T},
+    chain_params::ChainParameters{T}, sys_params::SystemParameters{T},
+    W_solv::Array{T,3}, grid::RadialGrid{T}
+) where {T}
+    dr = grid.Δr
+    starts = range(2.0, step=sampler.win_width - sampler.overlap, stop=sampler.sim_r_cut - sampler.win_width)
+    num_windows = length(starts)
+    
+    L_hists = Vector{Array{T,3}}(undef, num_windows)
+    R_hists = Vector{Array{T,3}}(undef, num_windows)
+    
+    println("   -> Simulating $num_windows windows in parallel...")
+    Threads.@threads for i in 1:num_windows
+        rng = TaskLocalRNG()
+        r_min = T(starts[i])
+        r_max = r_min + sampler.win_width
+        r_mid = r_min + sampler.overlap
+        
+        L_hists[i], R_hists[i] = run_window(configs, sys_params, chain_params, W_solv, grid, r_min, r_mid, r_max, dr, sampler.n_steps, rng)
+    end
+    
+    println("   -> Stitching overlapping matrices...")
+    N_sites = sys_params.N_sites
+    master_hist = zeros(T, N_sites, N_sites, grid.N)
+    
+    for s1 in 1:N_sites, s2 in 1:N_sites
+        master_pair = zeros(T, grid.N)
+        master_pair .+= L_hists[1][s1, s2, :]
+        current_R = R_hists[1][s1, s2, :]
+        
+        for i in 2:num_windows
+            L_i = L_hists[i][s1, s2, :]
+            R_i = R_hists[i][s1, s2, :]
+            
+            num = zero(T)
+            den = zero(T)
+            for j in 1:grid.N
+                num += current_R[j] * L_i[j]
+                den += L_i[j] * L_i[j]
+            end
+            alpha = den > 0 ? num / den : T(1.0)
+            
+            L_i_scaled = L_i .* alpha
+            R_i_scaled = R_i .* alpha
+            
+            C_i = zeros(T, grid.N)
+            for j in 1:grid.N
+                v1 = current_R[j]
+                v2 = L_i_scaled[j]
+                if v1 == 0 && v2 > 0
+                    C_i[j] = v2
+                elseif v2 == 0 && v1 > 0
+                    C_i[j] = v1
+                elseif v1 > 0 && v2 > 0
+                    denom = v1 + (alpha^2) * L_i[j]
+                    beta = ((alpha^2) * L_i[j]) / denom
+                    C_i[j] = beta * v1 + (1 - beta) * v2
+                end
+            end
+            master_pair .+= C_i
+            current_R .= R_i_scaled
+        end
+        master_pair .+= current_R
+        master_hist[s1, s2, :] .= master_pair
+    end
+    
+    # Phase 1 Normalization: Scale flat tail rigidly to 1.0
+    idx_norm_start = floor(Int, (sampler.sim_r_cut - 2.0) / dr)
+    idx_norm_end   = floor(Int, sampler.sim_r_cut / dr)
+    
+    for s1 in 1:N_sites, s2 in 1:N_sites
+        tail_mean = mean(master_hist[s1, s2, idx_norm_start:idx_norm_end])
+        if tail_mean > 0
+            master_hist[s1, s2, :] ./= tail_mean
+        end
+        
+        # Construct h(r) = g(r) - 1
+        for k in 1:grid.N
+            if k <= idx_norm_end
+                h_sim[s1, s2, k] = master_hist[s1, s2, k] - 1.0
+            else
+                h_sim[s1, s2, k] = 0.0 # Force tail to 0.0 structurally
+            end
+        end
+    end
+end

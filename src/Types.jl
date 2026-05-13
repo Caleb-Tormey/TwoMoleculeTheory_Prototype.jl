@@ -70,3 +70,13 @@ struct DivergenceCorrector{T<:AbstractFloat}
     begin_idx::Matrix{Int}       
     end_idx::Matrix{Int}         
 end
+
+# ---------------------------------------------------------
+# Window Sampling Types
+# ---------------------------------------------------------
+struct WindowSampler{T<:AbstractFloat} <: AbstractSampler
+    win_width::T
+    overlap::T
+    n_steps::Int
+    sim_r_cut::T
+end
